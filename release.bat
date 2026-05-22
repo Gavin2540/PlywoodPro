@@ -1,0 +1,114 @@
+@echo off
+echo ================================================================
+echo   PlywoodPro — Release Builder ^& GitHub Tagger
+echo ================================================================
+echo.
+echo REMINDER: Your GitHub repo MUST be PUBLIC for the auto-updater
+echo           to work without a personal access token.
+echo.
+echo ----------------------------------------------------------------
+
+REM ── Step 0: Ask for the new version number ──────────────────────
+set /p NEW_VERSION="Enter the new version number (e.g. 1.0.2): "
+if "%NEW_VERSION%"=="" (
+    echo ERROR: Version number cannot be empty.
+    goto error
+)
+echo.
+echo  New version: v%NEW_VERSION%
+echo.
+
+REM ── Step 1: Patch CURRENT_VERSION in updater.py ─────────────────
+echo [1/6] Patching CURRENT_VERSION in utils\updater.py ...
+powershell -NoProfile -Command ^
+    "(Get-Content 'utils\updater.py') -replace 'CURRENT_VERSION = \"[^\"]*\"', 'CURRENT_VERSION = \"%NEW_VERSION%\"' | Set-Content 'utils\updater.py'"
+if %ERRORLEVEL% neq 0 (
+    echo ERROR: Failed to patch updater.py
+    goto error
+)
+echo       Done.
+echo.
+
+REM ── Step 2: Install/verify dependencies ─────────────────────────
+echo [2/6] Verifying dependencies...
+pip install -r requirements.txt >nul 2>&1
+if %ERRORLEVEL% neq 0 (
+    echo ERROR: Failed to install requirements.
+    goto error
+)
+echo       Done.
+echo.
+
+REM ── Step 3: Clean and build with PyInstaller ────────────────────
+echo [3/6] Cleaning previous build artifacts...
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
+if exist PlywoodPro.spec del /q PlywoodPro.spec
+echo       Done.
+echo.
+
+echo [4/6] Building PlywoodPro.exe with PyInstaller...
+pyinstaller --onefile --windowed --icon=icon.ico --name=PlywoodPro --add-data "database/schema.sql;database" --add-data "icon.ico;." main.py
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo ERROR: PyInstaller build failed.
+    goto error
+)
+echo       Build successful.
+echo.
+
+REM ── Step 4: Zip the compiled output ─────────────────────────────
+echo [5/6] Creating release zip: PlywoodPro_v%NEW_VERSION%.zip ...
+if exist "PlywoodPro_v%NEW_VERSION%.zip" del /q "PlywoodPro_v%NEW_VERSION%.zip"
+powershell -NoProfile -Command ^
+    "Compress-Archive -Path 'dist\PlywoodPro.exe' -DestinationPath 'PlywoodPro_v%NEW_VERSION%.zip' -Force"
+if %ERRORLEVEL% neq 0 (
+    echo ERROR: Failed to create zip archive.
+    goto error
+)
+echo       Done. Archive: PlywoodPro_v%NEW_VERSION%.zip
+echo.
+
+REM ── Step 5: Git commit and tag ──────────────────────────────────
+echo [6/6] Committing, tagging, and pushing to GitHub...
+git add -A
+git commit -m "release v%NEW_VERSION%"
+git tag "v%NEW_VERSION%"
+git push origin master --tags
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo WARNING: Git push may have failed. Check your remote settings.
+    echo          You may need to run: git push origin main --tags
+    echo          (if your default branch is 'main' instead of 'master')
+)
+echo       Done.
+echo.
+
+REM ── Final: Print manual steps ───────────────────────────────────
+echo ================================================================
+echo   BUILD ^& TAG COMPLETE!  v%NEW_VERSION%
+echo ================================================================
+echo.
+echo   MANUAL STEPS REMAINING:
+echo   ─────────────────────────────────────────────────────────────
+echo   1. Go to: https://github.com/YOUR_USERNAME/YOUR_REPO/releases
+echo   2. Click "Draft a new release"
+echo   3. Choose the tag: v%NEW_VERSION%
+echo   4. Title: PlywoodPro v%NEW_VERSION%
+echo   5. Upload: PlywoodPro_v%NEW_VERSION%.zip
+echo   6. Click "Publish release"
+echo   ─────────────────────────────────────────────────────────────
+echo.
+echo   Once published, all users running PlywoodPro will see the
+echo   update prompt on their next app launch!
+echo.
+goto end
+
+:error
+echo.
+echo ================================================================
+echo   RELEASE FAILED — check the errors above.
+echo ================================================================
+
+:end
+pause
