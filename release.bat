@@ -20,8 +20,7 @@ echo.
 
 REM ── Step 1: Patch CURRENT_VERSION in updater.py ─────────────────
 echo [1/6] Patching CURRENT_VERSION in utils\updater.py ...
-powershell -NoProfile -Command ^
-    "(Get-Content 'utils\updater.py') -replace 'CURRENT_VERSION = \"[^\"]*\"', 'CURRENT_VERSION = \"%NEW_VERSION%\"' | Set-Content 'utils\updater.py'"
+python -c "import sys, re; f='utils/updater.py'; txt=open(f, encoding='utf-8').read(); open(f, 'w', encoding='utf-8').write(re.sub(r'CURRENT_VERSION = \".*\"', f'CURRENT_VERSION = \"{sys.argv[1]}\"', txt))" "%NEW_VERSION%"
 if %ERRORLEVEL% neq 0 (
     echo ERROR: Failed to patch updater.py
     goto error
@@ -31,7 +30,7 @@ echo.
 
 REM ── Step 2: Install/verify dependencies ─────────────────────────
 echo [2/6] Verifying dependencies...
-pip install -r requirements.txt >nul 2>&1
+python -m pip install -r requirements.txt >nul 2>&1
 if %ERRORLEVEL% neq 0 (
     echo ERROR: Failed to install requirements.
     goto error
