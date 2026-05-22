@@ -32,8 +32,8 @@ import urllib.error
 CURRENT_VERSION = "1.0.0"
 
 # Replace with your actual GitHub username and repository name
-GITHUB_USER = "YOUR_USERNAME"
-GITHUB_REPO = "YOUR_REPO"
+GITHUB_USER = "Gavin2540"
+GITHUB_REPO = "PlywoodPro"
 
 LATEST_RELEASE_URL = (
     f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"

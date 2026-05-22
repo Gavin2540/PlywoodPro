@@ -84,24 +84,24 @@ if %ERRORLEVEL% neq 0 (
 echo       Done.
 echo.
 
-REM ── Final: Print manual steps ───────────────────────────────────
-echo ================================================================
-echo   BUILD ^& TAG COMPLETE!  v%NEW_VERSION%
-echo ================================================================
-echo.
-echo   MANUAL STEPS REMAINING:
-echo   ─────────────────────────────────────────────────────────────
-echo   1. Go to: https://github.com/YOUR_USERNAME/YOUR_REPO/releases
-echo   2. Click "Draft a new release"
-echo   3. Choose the tag: v%NEW_VERSION%
-echo   4. Title: PlywoodPro v%NEW_VERSION%
-echo   5. Upload: PlywoodPro_v%NEW_VERSION%.zip
-echo   6. Click "Publish release"
-echo   ─────────────────────────────────────────────────────────────
-echo.
-echo   Once published, all users running PlywoodPro will see the
-echo   update prompt on their next app launch!
-echo.
+REM ── Final: GitHub Release Creation ────────────────────────────────
+echo [7/7] Creating GitHub Release and uploading zip...
+gh release create "v%NEW_VERSION%" "PlywoodPro_v%NEW_VERSION%.zip" --title "PlywoodPro v%NEW_VERSION%" --notes "Release v%NEW_VERSION%"
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo WARNING: Failed to create GitHub release via CLI.
+    echo          You can still create it manually at:
+    echo          https://github.com/Gavin2540/PlywoodPro/releases/new
+) else (
+    echo.
+    echo ================================================================
+    echo   BUILD ^& TAG COMPLETE!  v%NEW_VERSION% PUBLISHED!
+    echo ================================================================
+    echo.
+    echo   Once published, all users running PlywoodPro will see the
+    echo   update prompt on their next app launch!
+    echo.
+)
 goto end
 
 :error
