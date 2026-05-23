@@ -228,13 +228,20 @@ class ProductFormDialog(customtkinter.CTkToplevel):
             btn_container, text="Cancel", fg_color="#36322C", hover_color="#4D4942", font=customtkinter.CTkFont(family="Inter", size=13, weight="bold"),
             command=self.destroy
         )
-        cancel_btn.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        cancel_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        self.save_add_btn = customtkinter.CTkButton(
+            btn_container, text="Save & Add Another", fg_color="#453d33", hover_color="#5a5144", text_color="#FFFFFF", font=customtkinter.CTkFont(family="Inter", size=13, weight="bold"),
+            command=self.save_and_add_another
+        )
+        if not self.product:
+            self.save_add_btn.pack(side="left", fill="x", expand=True, padx=5)
 
         save_btn = customtkinter.CTkButton(
-            btn_container, text="Save Product", fg_color="#BA7517", hover_color="#A06312", font=customtkinter.CTkFont(family="Inter", size=13, weight="bold"),
+            btn_container, text="Save", fg_color="#BA7517", hover_color="#A06312", font=customtkinter.CTkFont(family="Inter", size=13, weight="bold"),
             command=self.save_product
         )
-        save_btn.pack(side="right", fill="x", expand=True, padx=(10, 0))
+        save_btn.pack(side="right", fill="x", expand=True, padx=(5, 0))
 
         # Fields container (Scrollable Frame)
         form = customtkinter.CTkScrollableFrame(self, fg_color="transparent")
@@ -294,7 +301,24 @@ class ProductFormDialog(customtkinter.CTkToplevel):
         self.e_limit.insert(0, str(p.get('low_stock_threshold', 10)))
         self.e_limit.pack(fill="x")
 
+    def save_and_add_another(self):
+        if self._perform_save():
+            # Clear fields for the next product
+            self.e_name.delete(0, tk.END)
+            self.e_brand.delete(0, tk.END)
+            self.e_thickness.delete(0, tk.END)
+            self.e_size.delete(0, tk.END)
+            self.e_pur_price.delete(0, tk.END)
+            self.e_pur_price.insert(0, "0.00")
+            self.e_sel_price.delete(0, tk.END)
+            self.e_sel_price.insert(0, "0.00")
+            self.e_name.focus()
+
     def save_product(self):
+        if self._perform_save():
+            self.destroy()
+
+    def _perform_save(self):
         name = self.e_name.get().strip()
         brand = self.e_brand.get().strip()
         type_ = self.e_type.get().strip()
@@ -308,7 +332,7 @@ class ProductFormDialog(customtkinter.CTkToplevel):
         # Validation
         if not name or not pur_str or not sel_str or not limit_str:
             messagebox.showerror("Validation Error", "All fields marked with '*' are required.")
-            return
+            return False
 
         try:
             purchase_price = float(pur_str)
@@ -317,7 +341,7 @@ class ProductFormDialog(customtkinter.CTkToplevel):
                 raise ValueError("Rates cannot be negative.")
         except ValueError:
             messagebox.showerror("Validation Error", "Rates must be valid positive numbers.")
-            return
+            return False
 
         try:
             limit = int(limit_str)
@@ -325,7 +349,7 @@ class ProductFormDialog(customtkinter.CTkToplevel):
                 raise ValueError("Limit cannot be negative.")
         except ValueError:
             messagebox.showerror("Validation Error", "Alert Limit must be a valid positive integer.")
-            return
+            return False
 
         # Insert or Update database
         try:
@@ -342,6 +366,7 @@ class ProductFormDialog(customtkinter.CTkToplevel):
             
             if self.callback:
                 self.callback()
-            self.destroy()
+            return True
         except Exception as ex:
             messagebox.showerror("Database Error", f"Failed to save product:\n{ex}")
+            return False

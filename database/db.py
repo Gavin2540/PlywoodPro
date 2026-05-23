@@ -14,8 +14,14 @@ class DatabaseManager:
     def initialize(cls, db_path=None):
         """Initialize the database path and run schema creation if needed."""
         if db_path is None:
-            # Default path: PlywoodPro/data/plywoodpro.db
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            import sys
+            if getattr(sys, 'frozen', False):
+                # Running as PyInstaller .exe — store DB next to the .exe
+                base_dir = os.path.dirname(sys.executable)
+            else:
+                # Dev mode — store DB in project root
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            
             data_dir = os.path.join(base_dir, "data")
             os.makedirs(data_dir, exist_ok=True)
             cls._db_path = os.path.join(data_dir, "plywoodpro.db")

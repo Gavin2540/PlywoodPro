@@ -6,6 +6,8 @@ from tkinter import messagebox
 from database.db import DatabaseManager
 import utils.helpers
 from utils.updater import check_for_updates_async, download_and_apply_update, CURRENT_VERSION
+from utils.backup import export_database, import_database
+from customtkinter import filedialog
 
 # Import all view modules lazily or directly
 from views.dashboard import DashboardFrame
@@ -21,7 +23,7 @@ class AppWindow(customtkinter.CTk):
         super().__init__()
 
         # Configure window settings
-        self.title("PlywoodPro — Professional Inventory & Margins")
+        self.title("Plywood Pro — Professional Inventory & Margins")
         self.geometry("1150x720")
         self.minimum_size = (1000, 650)
         self.minsize(1000, 650)
@@ -55,7 +57,7 @@ class AppWindow(customtkinter.CTk):
         # App Logo / Header
         self.logo_label = customtkinter.CTkLabel(
             self.sidebar_frame, 
-            text="PlywoodPro", 
+            text="Plywood Pro", 
             font=customtkinter.CTkFont(family="Inter", size=22, weight="bold"),
             text_color="#BA7517"
         )
@@ -97,6 +99,21 @@ class AppWindow(customtkinter.CTk):
             )
             btn.pack(fill="x", padx=12, pady=3)
             self.nav_buttons[key] = btn
+
+        # Data Management Buttons at bottom of sidebar
+        self.restore_btn = customtkinter.CTkButton(
+            self.sidebar_frame, text="⬇ Import Data", 
+            fg_color="transparent", hover_color="#36322C", text_color="#C9C5BC", 
+            anchor="w", corner_radius=6, command=self._import_data
+        )
+        self.restore_btn.pack(side="bottom", fill="x", padx=12, pady=(3, 20))
+
+        self.backup_btn = customtkinter.CTkButton(
+            self.sidebar_frame, text="⬆ Export Data", 
+            fg_color="transparent", hover_color="#36322C", text_color="#C9C5BC", 
+            anchor="w", corner_radius=6, command=self._export_data
+        )
+        self.backup_btn.pack(side="bottom", fill="x", padx=12, pady=3)
 
         # Content Area
         self.content_frame = customtkinter.CTkFrame(self, corner_radius=0, fg_color="#201F1D")
@@ -221,3 +238,54 @@ class AppWindow(customtkinter.CTk):
                 parent=self
             )
             self.set_status("Update failed. Continuing with current version.")
+
+    # ── Backup & Restore Callbacks ────────────────────────────────────────
+
+    def _export_data(self):
+        filename = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Backup",
+            defaultextension=".plypro",
+            initialfile=f"PlywoodPro_Backup_{datetime.datetime.now().strftime('%Y%m%d')}.plypro",
+            filetypes=[("PlywoodPro Backup", "*.plypro"), ("All Files", "*.*")]
+        )
+        if filename:
+            try:
+                export_database(filename)
+                messagebox.showinfo("Export Successful", f"Backup successfully saved to:\n{filename}", parent=self)
+            except Exception as e:
+                messagebox.showerror("Export Failed", f"An error occurred while exporting data:\n{str(e)}", parent=self)
+
+    def _import_data(self):
+        filename = filedialog.askopenfilename(
+            parent=self,
+            title="Import Backup",
+            filetypes=[("PlywoodPro Backup", "*.plypro"), ("All Files", "*.*")]
+        )
+        if filename:
+            confirm = messagebox.askyesno(
+                "Confirm Import",
+                "WARNING: Importing a backup will overwrite ALL your current data.\n\nAre you sure you want to proceed?",
+                parent=self,
+                icon="warning"
+            )
+            if confirm:
+                try:
+                    import_database(filename)
+                    # Reload all data in-place instead of restarting
+                    # 1. Clear all cached frames so they are rebuilt with fresh data
+                    for frame in list(self.frames.values()):
+                        try:
+                            frame.destroy()
+                        except Exception:
+                            pass
+                    self.frames.clear()
+                    self.current_frame = None
+                    # 2. Re-initialize database connection
+                    DatabaseManager.initialize()
+                    # 3. Navigate back to dashboard (rebuilds it fresh)
+                    self.switch_frame("dashboard")
+                    messagebox.showinfo("Import Successful", "Backup imported successfully.\nAll data has been reloaded.", parent=self)
+                    self.set_status("Data imported successfully.")
+                except Exception as e:
+                    messagebox.showerror("Import Failed", f"An error occurred while importing data:\n{str(e)}", parent=self)

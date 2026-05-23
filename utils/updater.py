@@ -29,7 +29,7 @@ import urllib.error
 #  ⚙️  CONFIGURATION — update these for your own GitHub repo
 # ─────────────────────────────────────────────────────────────────────────────
 
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.1"
 
 # Replace with your actual GitHub username and repository name
 GITHUB_USER = "Gavin2540"
@@ -40,7 +40,7 @@ LATEST_RELEASE_URL = (
 )
 
 # Name of your compiled executable (must match PyInstaller --name)
-EXE_NAME = "PlywoodPro.exe"
+EXE_NAME = "Plywood Pro.exe"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Version comparison helpers

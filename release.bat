@@ -43,11 +43,12 @@ echo [3/6] Cleaning previous build artifacts...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist PlywoodPro.spec del /q PlywoodPro.spec
+if exist "Plywood Pro.spec" del /q "Plywood Pro.spec"
 echo       Done.
 echo.
 
-echo [4/6] Building PlywoodPro.exe with PyInstaller...
-pyinstaller --onefile --windowed --icon=icon.ico --name=PlywoodPro --add-data "database/schema.sql;database" --add-data "icon.ico;." main.py
+echo [4/6] Building Plywood Pro.exe with PyInstaller...
+pyinstaller --onefile --windowed --icon=icon.ico --name="Plywood Pro" --hidden-import unicodedata --add-data "database/schema.sql;database" --add-data "icon.ico;." main.py
 if %ERRORLEVEL% neq 0 (
     echo.
     echo ERROR: PyInstaller build failed.
@@ -60,7 +61,7 @@ REM ── Step 4: Zip the compiled output ────────────�
 echo [5/6] Creating release zip: PlywoodPro_v%NEW_VERSION%.zip ...
 if exist "PlywoodPro_v%NEW_VERSION%.zip" del /q "PlywoodPro_v%NEW_VERSION%.zip"
 powershell -NoProfile -Command ^
-    "Compress-Archive -Path 'dist\PlywoodPro.exe' -DestinationPath 'PlywoodPro_v%NEW_VERSION%.zip' -Force"
+    "Compress-Archive -Path 'dist\Plywood Pro.exe' -DestinationPath 'PlywoodPro_v%NEW_VERSION%.zip' -Force"
 if %ERRORLEVEL% neq 0 (
     echo ERROR: Failed to create zip archive.
     goto error
