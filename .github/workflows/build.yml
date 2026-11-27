@@ -45,9 +45,13 @@ jobs:
       - name: Self-test the built .exe (opens every screen, saves a sale, writes PDF/Excel/backup)
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "dist/Plywood Pro.exe" -ArgumentList "--selftest" -Wait -PassThru
-          Get-ChildItem "$env:TEMP" -Filter "plywoodpro-selftest-*" -Directory | ForEach-Object { Get-Content (Join-Path $_.FullName "selftest.log") }
-          if ($p.ExitCode -ne 0) { throw "Self-test failed" }
+          # A windowed .exe gives PowerShell no dependable exit code, so the verdict is read from the log it writes.
+          Get-ChildItem "$env:TEMP" -Filter "plywoodpro-selftest-*" -Directory | Remove-Item -Recurse -Force
+          Start-Process -FilePath "dist/Plywood Pro.exe" -ArgumentList "--selftest" -Wait
+          $log = Get-ChildItem "$env:TEMP" -Filter "plywoodpro-selftest-*" -Directory | ForEach-Object { Join-Path $_.FullName "selftest.log" } | Select-Object -First 1
+          if (-not $log -or -not (Test-Path $log)) { throw "The .exe did not start or wrote no self-test log" }
+          Get-Content $log
+          if (-not (Select-String -Path $log -Pattern "^SELFTEST PASSED$" -Quiet)) { throw "Self-test failed" }
       - name: Package
         shell: pwsh
         run: |
