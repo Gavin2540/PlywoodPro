@@ -34,3 +34,19 @@ def window(qtbot, demo_db):
     qtbot.addWidget(w)
     w.show()
     return w
+
+
+# Qt can crash while Python tears it down after an offscreen run, turning a
+# fully passing run into a failing exit code. Leave with the real result instead.
+_exit_status = {"code": None}
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _exit_status["code"] = int(exitstatus)
+
+
+def pytest_unconfigure(config):
+    if _exit_status["code"] is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(_exit_status["code"])
