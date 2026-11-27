@@ -31,7 +31,19 @@ jobs:
       - name: Test
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q
+        shell: pwsh
+        run: |
+          # Qt can crash while Python shuts down after the tests, which gives a failing exit code
+          # even when every test passed. The verdict is therefore read from the results file.
+          python -m pytest -q --junitxml=test-results.xml
+          Write-Host "pytest exit code: $LASTEXITCODE"
+          if (-not (Test-Path test-results.xml)) { throw "The tests did not finish (no results file)" }
+          $suite = ([xml](Get-Content test-results.xml)).SelectSingleNode("//testsuite")
+          Write-Host "tests=$($suite.tests) failures=$($suite.failures) errors=$($suite.errors)"
+          if ([int]$suite.tests -lt 100) { throw "Too few tests ran" }
+          if ([int]$suite.failures -ne 0 -or [int]$suite.errors -ne 0) { throw "Tests failed" }
+          $global:LASTEXITCODE = 0
+          exit 0
       - name: Check the tag matches the app version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
