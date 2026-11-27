@@ -1,6 +1,7 @@
 # Builds the Windows .exe on GitHub's Windows machines, so releases can be made from a Mac.
 #
-#   Test build:  GitHub > Actions > "Build Windows app" > Run workflow  (download the .exe from the run's Artifacts)
+#   Test build:  push to the v2 branch, or GitHub > Actions > "Build Windows app" > Run workflow
+#                (download the .exe from the run's Artifacts; nothing is published)
 #   Release:     set CURRENT_VERSION in utils/updater.py, commit, then
 #                git tag v2.0.0 && git push origin v2.0.0
 #                -> tests run, the .exe is built, zipped and published as a GitHub Release.
@@ -10,7 +11,8 @@ name: Build Windows app
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    tags: ["v*"]          # a version tag builds AND publishes a release
+    branches: ["v2"]      # a push to v2 only builds a test .exe (no release)
 
 permissions:
   contents: write
