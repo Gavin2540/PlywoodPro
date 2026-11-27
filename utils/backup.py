@@ -1,61 +1,111 @@
-import os
-import sys
-import zipfile
-import shutil
+"""Backup and restore.
+
+A ``.plypro`` file is a zip holding ``plywoodpro.db`` and ``meta.json``.
+Restoring validates the file in a temporary folder first and always keeps a
+safety copy of the current data, so a bad file can never destroy the books.
+"""
+import datetime
+import glob
 import json
-from datetime import datetime
+import os
+import shutil
+import sqlite3
+import tempfile
+import zipfile
+
 from database.db import DatabaseManager
 
-def export_database(destination_path):
-    """
-    Exports the current database as a .plypro file (zip archive).
-    """
-    db_path = DatabaseManager._db_path
-    if not db_path or not os.path.exists(db_path):
-        raise FileNotFoundError("Database file not found.")
+REQUIRED_TABLES = {"products", "purchases", "sales", "expenses"}
 
-    # Create metadata
-    metadata = {
-        "export_date": datetime.now().isoformat(),
-        "app": "PlywoodPro",
-        "version": "1.0"
-    }
 
-    # Create temporary metadata file
-    meta_path = db_path + ".meta.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=4)
+def _backup_dir():
+    path = os.path.join(os.path.dirname(DatabaseManager.db_path()), "backups")
+    os.makedirs(path, exist_ok=True)
+    return path
 
+
+def _snapshot(dest_db_path):
+    """Consistent copy of the live database, safe while the app is using it."""
+    dest = sqlite3.connect(dest_db_path)
     try:
-        # Create the zip archive (.plypro)
-        with zipfile.ZipFile(destination_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(db_path, arcname="plywoodpro.db")
-            zipf.write(meta_path, arcname="meta.json")
+        DatabaseManager.get_connection().backup(dest)
     finally:
-        if os.path.exists(meta_path):
-            os.remove(meta_path)
+        dest.close()
+
+
+def export_database(destination_path):
+    """Write the current data to a .plypro backup file."""
+    from utils.updater import CURRENT_VERSION
+    with tempfile.TemporaryDirectory() as tmp:
+        db_copy = os.path.join(tmp, "plywoodpro.db")
+        _snapshot(db_copy)
+        meta = {"export_date": datetime.datetime.now().isoformat(timespec="seconds"),
+                "app": "PlywoodPro", "version": CURRENT_VERSION}
+        with zipfile.ZipFile(destination_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(db_copy, arcname="plywoodpro.db")
+            z.writestr("meta.json", json.dumps(meta, indent=2))
+    return destination_path
+
+
+def _validate(db_file):
+    try:
+        conn = sqlite3.connect(db_file)
+        try:
+            ok = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        raise ValueError("The backup file is damaged or is not a Plywood Pro backup.")
+    if ok != "ok" or not REQUIRED_TABLES <= tables:
+        raise ValueError("The backup file is damaged or is not a Plywood Pro backup.")
+
 
 def import_database(source_path):
-    """
-    Imports a .plypro file, replacing the current database.
-    """
-    db_path = DatabaseManager._db_path
-    if not db_path:
-        DatabaseManager.initialize()
-        db_path = DatabaseManager._db_path
-
+    """Replace the current data with a backup. Returns the path of the safety copy."""
     if not zipfile.is_zipfile(source_path):
-        raise ValueError("Selected file is not a valid PlywoodPro backup.")
+        raise ValueError("The selected file is not a Plywood Pro backup.")
+    db_path = DatabaseManager.db_path()
+    with tempfile.TemporaryDirectory() as tmp:
+        with zipfile.ZipFile(source_path) as z:
+            if "plywoodpro.db" not in z.namelist():
+                raise ValueError("The selected file is not a Plywood Pro backup.")
+            z.extract("plywoodpro.db", tmp)
+        candidate = os.path.join(tmp, "plywoodpro.db")
+        _validate(candidate)
 
-    with zipfile.ZipFile(source_path, 'r') as zipf:
-        file_list = zipf.namelist()
-        if "plywoodpro.db" not in file_list:
-            raise ValueError("Backup file is missing the database component.")
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        safety = os.path.join(_backup_dir(), f"before-restore-{stamp}.db")
+        _snapshot(safety)
 
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        
-        # Replace the database file
-        # We need to ensure we can overwrite it. If it's locked, this might raise an error.
-        temp_dir = os.path.dirname(db_path)
-        zipf.extract("plywoodpro.db", temp_dir)
+        DatabaseManager.close()
+        for suffix in ("-wal", "-shm", "-journal"):
+            if os.path.exists(db_path + suffix):
+                os.remove(db_path + suffix)
+        shutil.copy2(candidate, db_path)
+    try:
+        DatabaseManager.initialize(db_path)  # also upgrades an older backup
+    except Exception:
+        DatabaseManager.close()
+        shutil.copy2(safety, db_path)
+        DatabaseManager.initialize(db_path)
+        raise ValueError("That backup could not be opened, so your current data was kept.")
+    return safety
+
+
+def auto_backup(keep=14):
+    """One automatic backup per day, keeping the most recent ``keep`` files."""
+    target = os.path.join(_backup_dir(), f"auto-{datetime.date.today().isoformat()}.plypro")
+    export_database(target)
+    files = sorted(glob.glob(os.path.join(_backup_dir(), "auto-*.plypro")))
+    for old in files[:-keep] if keep > 0 else []:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return target
+
+
+def list_backups():
+    files = glob.glob(os.path.join(_backup_dir(), "*"))
+    return sorted(files, key=os.path.getmtime, reverse=True)

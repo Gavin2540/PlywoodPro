@@ -1,231 +1,174 @@
+"""Auto-updater: pulls new versions from GitHub Releases.
+
+The GitHub repository must be public. Flow:
+  1. ``fetch_update()`` asks GitHub for the latest release and returns its
+     details when it is newer than CURRENT_VERSION.
+  2. ``download_update()`` downloads the .zip and verifies its SHA-256 against
+     the digest GitHub publishes for the asset (or a ``<zip>.sha256`` asset).
+     A download that does not match is deleted and never run.
+  3. ``apply_update()`` (Windows .exe only) writes a small script that waits
+     for this process to exit, replaces the .exe and restarts it.
+
+Uses only the standard library.
 """
-PlywoodPro Auto-Updater Engine
-================================
-Silent background updater that pulls new versions from GitHub Releases.
-
-IMPORTANT: Your GitHub repository MUST be set to PUBLIC for this to work
-without an authentication token. If the repo is private, you will need to
-add a "Authorization: token YOUR_PAT" header to the urllib request.
-
-How it works:
-  1. A daemon thread fires on app startup and hits the GitHub Releases API.
-  2. It compares the remote tag_name (e.g. "v1.0.2") against CURRENT_VERSION.
-  3. If a newer version exists, it calls a callback on the main UI thread.
-  4. When the user accepts, it downloads the .zip, generates a tiny .bat
-     that overwrites the old files and restarts the new .exe, then exits.
-
-Uses only built-in stdlib (urllib) — no 'requests' dependency.
-"""
-
-import sys
-import os
+import hashlib
 import json
-import threading
+import os
+import subprocess
+import sys
 import tempfile
-import urllib.request
 import urllib.error
+import urllib.request
+import zipfile
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ⚙️  CONFIGURATION — update these for your own GitHub repo
-# ─────────────────────────────────────────────────────────────────────────────
+CURRENT_VERSION = "2.0.0"
 
-CURRENT_VERSION = "1.0.1"
-
-# Replace with your actual GitHub username and repository name
 GITHUB_USER = "Gavin2540"
 GITHUB_REPO = "PlywoodPro"
+LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
+RELEASES_PAGE = f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
+EXE_NAME = "Plywood Pro.exe"  # must match the PyInstaller --name
+_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": "PlywoodPro-Updater"}
 
-LATEST_RELEASE_URL = (
-    f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
-)
 
-# Name of your compiled executable (must match PyInstaller --name)
-EXE_NAME = "Plywood Pro.exe"
+class UpdateError(RuntimeError):
+    pass
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Version comparison helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_version(tag: str) -> tuple:
-    """Strips leading 'v' and splits into a tuple of ints for comparison.
-       e.g. 'v1.2.3' -> (1, 2, 3)
-    """
-    tag = tag.strip().lstrip("vV")
+def _parse_version(tag):
     parts = []
-    for p in tag.split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            parts.append(0)
+    for p in str(tag).strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in p if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
     return tuple(parts)
 
 
-def is_newer(remote_tag: str, local_version: str = CURRENT_VERSION) -> bool:
-    """Returns True if remote_tag represents a version newer than local_version."""
-    return _parse_version(remote_tag) > _parse_version(local_version)
+def is_newer(remote_tag, local_version=CURRENT_VERSION):
+    a, b = _parse_version(remote_tag), _parse_version(local_version)
+    n = max(len(a), len(b))
+    return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Core: Check for updates (runs in background thread)
-# ─────────────────────────────────────────────────────────────────────────────
+def can_self_update():
+    """Only the packaged Windows .exe can replace itself."""
+    return sys.platform.startswith("win") and getattr(sys, "frozen", False)
 
-def _fetch_latest_release() -> dict | None:
-    """Hits the GitHub API and returns the JSON payload, or None on any failure."""
+
+def _get_json(url, timeout=6):
+    req = urllib.request.Request(url, headers=_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_update():
+    """Return {"version", "url", "sha256", "size", "notes"} if a newer release exists, else None.
+
+    Never raises: with no internet it simply returns None.
+    """
     try:
-        req = urllib.request.Request(
-            LATEST_RELEASE_URL,
-            headers={
-                "Accept": "application/vnd.github.v3+json",
-                "User-Agent": "PlywoodPro-Updater",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
-        # Network down, rate-limited, timeout, etc. — fail silently
+        release = _get_json(LATEST_RELEASE_URL)
+    except (urllib.error.URLError, OSError, ValueError):
         return None
-
-
-def _find_zip_asset(release_data: dict) -> dict | None:
-    """Finds the first .zip file in the release's assets list."""
-    for asset in release_data.get("assets", []):
-        if asset.get("name", "").lower().endswith(".zip"):
-            return asset
-    return None
-
-
-def check_for_updates(callback):
-    """
-    Background worker (called inside a daemon thread).
-    
-    If a newer release is found, invokes `callback(version, download_url)`
-    from the BACKGROUND thread. The caller is responsible for marshalling
-    to the main thread (see check_for_updates_async below).
-    """
-    release = _fetch_latest_release()
-    if release is None:
-        return  # No internet or API issue — silently abort
-
-    remote_tag = release.get("tag_name", "")
-    if not remote_tag or not is_newer(remote_tag):
-        return  # Already up-to-date
-
-    zip_asset = _find_zip_asset(release)
-    if zip_asset is None:
-        return  # Release exists but has no zip — nothing to download
-
-    download_url = zip_asset.get("browser_download_url", "")
-    if download_url:
-        callback(remote_tag, download_url)
-
-
-def check_for_updates_async(callback):
-    """
-    Kicks off the update check in a daemon thread so it never blocks the UI.
-    
-    Usage from your main window:
-        from utils.updater import check_for_updates_async
-        check_for_updates_async(lambda ver, url: self.after(0, self._on_update_available, ver, url))
-    """
-    t = threading.Thread(target=check_for_updates, args=(callback,), daemon=True)
-    t.start()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Core: Download & apply the update
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _get_app_dir() -> str:
-    """Returns the directory where the running .exe (or script) lives."""
-    if getattr(sys, "frozen", False):
-        # Running as a PyInstaller bundle
-        return os.path.dirname(sys.executable)
+    tag = release.get("tag_name", "")
+    if not tag or not is_newer(tag):
+        return None
+    assets = release.get("assets", [])
+    zip_asset = next((a for a in assets if a.get("name", "").lower().endswith(".zip")), None)
+    if not zip_asset or not zip_asset.get("browser_download_url"):
+        return None
+    sha = None
+    digest = zip_asset.get("digest") or ""
+    if digest.startswith("sha256:"):
+        sha = digest.split(":", 1)[1].strip().lower()
     else:
-        # Running as a normal Python script (dev mode)
-        return os.path.dirname(os.path.abspath(__file__))
-
-
-def download_and_apply_update(download_url: str, progress_callback=None):
-    """
-    Downloads the zip, writes a self-destructing .bat updater, and exits.
-    
-    The batch script:
-      1. Waits 2 seconds for this process to fully terminate.
-      2. Uses PowerShell Expand-Archive to extract and overwrite files.
-      3. Deletes the downloaded .zip.
-      4. Restarts the new .exe.
-      5. Deletes itself.
-    
-    Args:
-        download_url: Direct URL to the .zip asset from GitHub Releases.
-        progress_callback: Optional callable(bytes_downloaded, total_bytes)
-                           for showing a progress bar in the UI.
-    """
-    app_dir = _get_app_dir()
-    zip_filename = "PlywoodPro_update.zip"
-    zip_path = os.path.join(app_dir, zip_filename)
-    bat_path = os.path.join(app_dir, "_apply_update.bat")
-    exe_path = os.path.join(app_dir, EXE_NAME)
-
-    # ── Step 1: Download the zip ──────────────────────────────────────────
-    try:
-        req = urllib.request.Request(
-            download_url,
-            headers={"User-Agent": "PlywoodPro-Updater"},
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            chunk_size = 65536  # 64 KB chunks
-            with open(zip_path, "wb") as f:
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_callback and total > 0:
-                        progress_callback(downloaded, total)
-    except Exception as e:
-        # Clean up partial download
-        if os.path.exists(zip_path):
+        side = next((a for a in assets if a.get("name") == zip_asset["name"] + ".sha256"), None)
+        if side:
             try:
-                os.remove(zip_path)
-            except OSError:
-                pass
-        raise RuntimeError(f"Download failed: {e}")
+                req = urllib.request.Request(side["browser_download_url"], headers=_HEADERS)
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    sha = resp.read().decode("utf-8").split()[0].strip().lower()
+            except (urllib.error.URLError, OSError, IndexError):
+                sha = None
+    return {"version": tag, "url": zip_asset["browser_download_url"], "sha256": sha,
+            "size": zip_asset.get("size", 0), "notes": release.get("body") or ""}
 
-    # ── Step 2: Generate the update batch script ──────────────────────────
-    #
-    # Key design decisions:
-    #   - "timeout /t 2" gives the Python process time to fully exit.
-    #   - "-Force" on Expand-Archive overwrites existing files.
-    #   - The batch file deletes itself at the very end (del "%~f0").
-    #
-    bat_content = f"""@echo off
-echo ============================================
-echo   PlywoodPro Auto-Updater — Applying update
-echo ============================================
-echo.
-echo Waiting for application to close...
-timeout /t 2 /nobreak >nul
 
-echo Extracting update files...
-powershell -NoProfile -Command "Expand-Archive -Path '{zip_path}' -DestinationPath '{app_dir}' -Force"
+def download_update(update, progress=None):
+    """Download and verify the release zip. Returns its path. Raises UpdateError."""
+    if not update.get("sha256"):
+        raise UpdateError("This release has no checksum, so it cannot be verified. "
+                          "Please download it from the releases page instead.")
+    if not update["url"].startswith("https://"):
+        raise UpdateError("The download link is not secure.")
+    folder = tempfile.mkdtemp(prefix="plywoodpro-update-")
+    zip_path = os.path.join(folder, "update.zip")
+    hasher = hashlib.sha256()
+    try:
+        req = urllib.request.Request(update["url"], headers={"User-Agent": _HEADERS["User-Agent"]})
+        with urllib.request.urlopen(req, timeout=30) as resp, open(zip_path, "wb") as f:
+            total = int(resp.headers.get("Content-Length") or update.get("size") or 0)
+            done = 0
+            while True:
+                chunk = resp.read(131072)
+                if not chunk:
+                    break
+                f.write(chunk)
+                hasher.update(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(done, total)
+    except (urllib.error.URLError, OSError) as e:
+        _discard(zip_path)
+        raise UpdateError(f"The download failed: {e}")
+    if hasher.hexdigest().lower() != update["sha256"]:
+        _discard(zip_path)
+        raise UpdateError("The downloaded file did not match its checksum and was discarded.")
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            if EXE_NAME not in z.namelist():
+                raise UpdateError("The update package is not in the expected format.")
+    except zipfile.BadZipFile:
+        _discard(zip_path)
+        raise UpdateError("The update package is damaged.")
+    return zip_path
 
-echo Cleaning up...
-del /f /q "{zip_path}"
 
-echo Restarting PlywoodPro...
-start "" "{exe_path}"
+def _discard(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
-echo Update complete!
-(goto) 2>nul & del "%~f0"
-"""
 
-    with open(bat_path, "w", encoding="utf-8") as f:
-        f.write(bat_content)
-
-    # ── Step 3: Launch the batch script and exit ──────────────────────────
-    os.startfile(bat_path)
-    sys.exit(0)
+def apply_update(zip_path):
+    """Replace the running .exe with the downloaded one and restart. Windows only."""
+    if not can_self_update():
+        raise UpdateError("Automatic install is only available in the Windows app.")
+    app_dir = os.path.dirname(sys.executable)
+    script = os.path.join(os.path.dirname(zip_path), "apply_update.bat")
+    ps = lambda s: s.replace("'", "''")  # PowerShell single-quote escaping
+    lines = [
+        "@echo off",
+        "title Plywood Pro - updating",
+        "echo Updating Plywood Pro, please wait...",
+        ":wait",
+        f'tasklist /FI "PID eq {os.getpid()}" 2>nul | find "{os.getpid()}" >nul',
+        "if not errorlevel 1 (",
+        "  timeout /t 1 /nobreak >nul",
+        "  goto wait",
+        ")",
+        f"powershell -NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -LiteralPath '{ps(zip_path)}' "
+        f"-DestinationPath '{ps(app_dir)}' -Force\"",
+        "if errorlevel 1 (",
+        "  echo The update could not be installed. Your current version is unchanged.",
+        "  pause",
+        "  exit /b 1",
+        ")",
+        f'del /f /q "{zip_path}"',
+        f'start "" "{os.path.join(app_dir, EXE_NAME)}"',
+        '(goto) 2>nul & del "%~f0"',
+    ]
+    with open(script, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    subprocess.Popen(["cmd", "/c", script], cwd=app_dir,
+                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0), close_fds=True)

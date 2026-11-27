@@ -1,111 +1,98 @@
+"""Formatting and parsing helpers shared by the UI and exports."""
 import datetime
-import re
-import sys
+import math
 import os
+import sys
+
 
 def get_resource_path(relative_path):
-    """Get absolute path to resource, works for dev and for PyInstaller"""
-    try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
+    """Absolute path to a bundled file, in dev and inside the PyInstaller exe."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative_path)
 
-    return os.path.join(base_path, relative_path)
 
-def format_currency(amount):
-    """Formats a number into Indian Rupee style currency.
-    Example: 1543200.50 -> ₹15,43,200.50
-    """
-    if amount is None:
-        return "₹0.00"
-    
-    try:
-        amount = float(amount)
-    except ValueError:
-        return "₹0.00"
-
-    sign = "-" if amount < 0 else ""
-    amount = abs(amount)
-    
-    # Split decimal and integer parts
-    s = f"{amount:.2f}"
-    parts = s.split('.')
-    int_part = parts[0]
-    dec_part = parts[1]
-    
-    # Indian numbering formatting logic
+def _indian_group(int_part):
     if len(int_part) <= 3:
-        formatted_int = int_part
-    else:
-        last_three = int_part[-3:]
-        remaining = int_part[:-3]
-        # Group remaining digits in twos
-        chunks = []
-        while remaining:
-            chunks.append(remaining[-2:])
-            remaining = remaining[:-2]
-        chunks.reverse()
-        formatted_int = ",".join(chunks) + "," + last_three
-        
-    return f"{sign}₹{formatted_int}.{dec_part}"
+        return int_part
+    head, tail = int_part[:-3], int_part[-3:]
+    chunks = []
+    while head:
+        chunks.append(head[-2:])
+        head = head[:-2]
+    return ",".join(reversed(chunks)) + "," + tail
 
-def format_date(date_str):
-    """Formats a YYYY-MM-DD date string into DD-MM-YYYY for display."""
+
+def format_currency(amount, symbol="₹", decimals=2):
+    """1543200.5 -> ₹15,43,200.50 (Indian grouping). Never shows '-₹0.00'."""
+    try:
+        amount = float(amount or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if not math.isfinite(amount):
+        amount = 0.0
+    amount = round(amount, decimals)
+    sign = "-" if amount < 0 else ""
+    text = f"{abs(amount):.{decimals}f}"
+    int_part, _, dec_part = text.partition(".")
+    return f"{sign}{symbol}{_indian_group(int_part)}" + (f".{dec_part}" if decimals else "")
+
+
+def format_compact(amount, symbol="₹"):
+    """Short money for cards and chart axes: ₹1.25L, ₹3.4Cr, ₹950."""
+    amount = float(amount or 0)
+    sign, a = ("-" if amount < 0 else ""), abs(amount)
+    if a >= 1e7:
+        return f"{sign}{symbol}{a / 1e7:.2f}Cr"
+    if a >= 1e5:
+        return f"{sign}{symbol}{a / 1e5:.2f}L"
+    if a >= 1e3:
+        return f"{sign}{symbol}{a / 1e3:.1f}K"
+    return f"{sign}{symbol}{a:.0f}"
+
+
+def format_qty(qty, unit=None):
+    """12.0 -> '12', 12.5 -> '12.5'; optional unit suffix."""
+    qty = float(qty or 0)
+    text = f"{qty:.2f}".rstrip("0").rstrip(".")
+    if text == "-0":
+        text = "0"
+    return f"{text} {unit}" if unit else text
+
+
+def format_date(date_str, fmt="%d-%m-%Y"):
+    """'2026-05-21' -> '21-05-2026'. Returns the input if it is not a date."""
     if not date_str:
         return ""
     try:
-        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-        return dt.strftime("%d-%m-%Y")
+        return datetime.datetime.strptime(str(date_str)[:10], "%Y-%m-%d").strftime(fmt)
     except ValueError:
-        return date_str
+        return str(date_str)
 
-def parse_date(date_str):
-    """Validates and converts various date formats (e.g. DD-MM-YYYY or YYYY-MM-DD) to YYYY-MM-DD."""
-    date_str = str(date_str).strip()
-    
-    # Try YYYY-MM-DD
-    try:
-        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-        
-    # Try DD-MM-YYYY
-    try:
-        dt = datetime.datetime.strptime(date_str, "%d-%m-%y")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-        
-    try:
-        dt = datetime.datetime.strptime(date_str, "%d-%m-%Y")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-        
-    raise ValueError("Invalid date format. Use DD-MM-YYYY or YYYY-MM-DD.")
 
-def validate_positive_float(value, field_name="Field"):
-    """Validates that a string is a positive float and returns it."""
-    try:
-        val = float(value)
-        if val <= 0:
-            raise ValueError(f"{field_name} must be greater than zero.")
-        return val
-    except ValueError as e:
-        if "greater than zero" in str(e):
-            raise
-        raise ValueError(f"{field_name} must be a valid number.")
+def parse_date(text):
+    """Accept DD-MM-YYYY, DD/MM/YYYY, DD-MM-YY or YYYY-MM-DD; return YYYY-MM-DD."""
+    text = str(text).strip().replace("/", "-").replace(".", "-")
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y"):
+        try:
+            return datetime.datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise ValueError("Enter the date as DD-MM-YYYY.")
 
-def validate_positive_int(value, field_name="Field"):
-    """Validates that a string is a positive integer and returns it."""
+
+def parse_number(text, field="Value", minimum=None, allow_zero=True):
+    """Parse a user-typed number (commas and ₹ allowed); reject nan/inf."""
+    cleaned = str(text).replace(",", "").replace("₹", "").strip()
+    if not cleaned:
+        raise ValueError(f"{field} is required.")
     try:
-        val = int(value)
-        if val <= 0:
-            raise ValueError(f"{field_name} must be greater than zero.")
-        return val
-    except ValueError as e:
-        if "greater than zero" in str(e):
-            raise
-        raise ValueError(f"{field_name} must be a valid integer.")
+        value = float(cleaned)
+    except ValueError:
+        raise ValueError(f"{field} must be a number.")
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be a number.")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{field} cannot be less than {minimum:g}.")
+    if not allow_zero and value == 0:
+        raise ValueError(f"{field} must be greater than zero.")
+    return value

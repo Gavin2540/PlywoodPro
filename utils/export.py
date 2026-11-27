@@ -1,773 +1,444 @@
+"""Report exports (PDF and Excel) for any date range. Data comes from the models only."""
 import datetime
-import os
-import sqlite3
-from database.db import get_db
+from xml.sax.saxutils import escape
 
-# openpyxl for Excel exports
 import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-
-# reportlab for PDF exports
-from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
+from reportlab.platypus import (CondPageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle)
 
-import models.sale as sale_model
-import models.expense as expense_model
-import models.ledger as ledger_model
-import utils.helpers as helpers
+from models import bills, expense, reports, settings, stock
+from utils.helpers import format_currency, format_date, format_qty
+
+MAX_ITEMISED = 60          # more lines than this -> summarise by product in the PDF
+BRAND = "#BA7517"
+INK = "#1F1E1B"
+GREEN = "#1F8F55"
+RED = "#C0392B"
+MUTED = "#6B665E"
+RULE = "#E2DED6"
+ZEBRA = "#F8F6F2"
+NUM_FMT = "#,##0.00"
+
+
+# ── shared data ─────────────────────────────────────────────────────────
+def _iso(d):
+    return d.isoformat() if isinstance(d, (datetime.date, datetime.datetime)) else str(d)[:10]
+
+
+def _norm(date_from, date_to):
+    a, b = _iso(date_from), _iso(date_to)
+    return (b, a) if a > b else (a, b)
+
+
+def _product_text(r, prefix="product_"):
+    """'Plywood 18mm · Greenply · 8x4' from a model row."""
+    head = " ".join(str(r.get(prefix + k)) for k in ("name", "thickness") if r.get(prefix + k))
+    extra = [str(r[prefix + k]) for k in ("brand", "size") if r.get(prefix + k)]
+    return " · ".join([head] + extra) if head else " · ".join(extra)
+
+
+def _period_text(a, b):
+    if a == b:
+        return f"Daily report — {format_date(a)}"
+    return f"{format_date(a)} to {format_date(b)}"
+
+
+def _shop():
+    s = settings.get_all()
+    return {"name": (s.get("shop_name") or "").strip() or "Plywood Pro",
+            "address": (s.get("shop_address") or "").strip(),
+            "phone": (s.get("shop_phone") or "").strip(),
+            "gstin": (s.get("shop_gstin") or "").strip()}
+
+
+def _collect(date_from, date_to):
+    a, b = _norm(date_from, date_to)
+    data = {
+        "from": a, "to": b, "single": a == b,
+        "shop": _shop(),
+        "summary": reports.summary(a, b),
+        "sales": bills.list_lines("sale", a, b),
+        "purchases": bills.list_lines("purchase", a, b),
+        "expenses": expense.list_expenses(a, b),
+        "products": reports.product_performance(a, b),
+        "daily": reports.daily_series(a, b),
+        "ledger": stock.day_ledger(a) if a == b else None,
+        "stock": None,
+    }
+    if a != b:
+        data["stock"] = reports.stock_overview()
+    return data
+
+
+def _purchase_by_product(lines):
+    agg = {}
+    for r in lines:
+        d = agg.setdefault(r["product_id"], {"product": _product_text(r), "unit": r.get("product_unit"),
+                                             "qty": 0.0, "amount": 0.0})
+        d["qty"] += r["qty"]
+        d["amount"] += r["amount"]
+    return sorted(agg.values(), key=lambda x: -x["amount"])
+
+
+def _ledger_note(r):
+    if r.get("is_counted"):
+        return "Counted"
+    return "Closed" if r.get("is_locked") else ""
+
+
+# ── PDF ─────────────────────────────────────────────────────────────────
+def _rs(x):
+    return format_currency(x, symbol="Rs. ")
+
+
+def _styles():
+    base = getSampleStyleSheet()["Normal"]
+
+    def ps(name, **kw):
+        return ParagraphStyle(name, parent=base, **kw)
+    return {
+        "shop": ps("shop", fontName="Helvetica-Bold", fontSize=17, leading=21, textColor=colors.HexColor(INK)),
+        "meta": ps("meta", fontSize=8.5, leading=11, textColor=colors.HexColor(MUTED)),
+        "title": ps("title", fontName="Helvetica-Bold", fontSize=13, leading=16, textColor=colors.HexColor(BRAND),
+                    alignment=2),
+        "period": ps("period", fontSize=9.5, leading=12, textColor=colors.HexColor(INK), alignment=2),
+        "h": ps("h", fontName="Helvetica-Bold", fontSize=11.5, leading=14, textColor=colors.HexColor(INK),
+                spaceBefore=14, spaceAfter=5),
+        "note": ps("note", fontSize=8, leading=10.5, textColor=colors.HexColor(MUTED), spaceAfter=4,
+                   fontName="Helvetica-Oblique"),
+        "cell": ps("cell", fontSize=8, leading=10),
+        "cellr": ps("cellr", fontSize=8, leading=10, alignment=2),
+        "head": ps("head", fontName="Helvetica-Bold", fontSize=7.5, leading=9, textColor=colors.white),
+        "headr": ps("headr", fontName="Helvetica-Bold", fontSize=7.5, leading=9, textColor=colors.white,
+                    alignment=2),
+        "kpi_l": ps("kpi_l", fontSize=7.5, leading=9, textColor=colors.HexColor(MUTED)),
+        "kpi_v": ps("kpi_v", fontName="Helvetica-Bold", fontSize=12, leading=15, textColor=colors.HexColor(INK)),
+        "kpi_s": ps("kpi_s", fontSize=7.5, leading=9, textColor=colors.HexColor(MUTED)),
+        "empty": ps("empty", fontSize=9, leading=12, textColor=colors.HexColor(MUTED)),
+    }
+
+
+def _p(text, style):
+    return Paragraph(escape(str(text if text is not None else "")), style)
+
+
+def _table(headers, rows, widths, st, right=(), total=None):
+    """Header row (repeats on page breaks), body rows, optional bold total row."""
+    right = set(right)
+    data = [[_p(h, st["headr"] if i in right else st["head"]) for i, h in enumerate(headers)]]
+    for r in rows:
+        data.append([c if not isinstance(c, (str, int, float)) else _p(c, st["cellr"] if i in right else st["cell"])
+                     for i, c in enumerate(r)])
+    cmds = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(INK)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("LINEBELOW", (0, 1), (-1, -1), 0.25, colors.HexColor(RULE)),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor(ZEBRA)]),
+    ]
+    if total:
+        bold_r = ParagraphStyle("tr", parent=st["cellr"], fontName="Helvetica-Bold")
+        bold_l = ParagraphStyle("tl", parent=st["cell"], fontName="Helvetica-Bold")
+        data.append([_p(c, bold_r if i in right else bold_l) for i, c in enumerate(total)])
+        cmds += [("LINEABOVE", (0, -1), (-1, -1), 0.9, colors.HexColor(INK)),
+                 ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#EFEAE0"))]
+    t = Table(data, colWidths=widths, repeatRows=1)
+    t.setStyle(TableStyle(cmds))
+    return t
+
+
+def _kpi_block(s, st, width):
+    def cell(label, value, sub=""):
+        return [_p(label.upper(), st["kpi_l"]), _p(value, st["kpi_v"]), _p(sub, st["kpi_s"])]
+    row1 = [cell("Sales", _rs(s["revenue"]), f"{s['sale_bills']} {'bill' if s['sale_bills'] == 1 else 'bills'} · {format_qty(s['qty_sold'])} qty"),
+            cell("Gross profit", _rs(s["gross_profit"]), f"{s['margin_pct']:.1f}% margin"),
+            cell("Expenses", _rs(s["expenses"])),
+            cell("Purchases", _rs(s["purchases"]), f"{s['purchase_bills']} {'bill' if s['purchase_bills'] == 1 else 'bills'}")]
+    row2 = [cell("Collected from customers", _rs(s["collected"])),
+            cell("Paid to suppliers", _rs(s["paid_out"])),
+            cell("Discounts given", _rs(s["discount"])), ""]
+    w = width / 4
+    t = Table([row1, row2], colWidths=[w] * 4)
+    t.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor(RULE)),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor(RULE)),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(ZEBRA)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    net = s["net_profit"]
+    good = net >= 0
+    colr = colors.HexColor(GREEN if good else RED)
+    banner = Table([[Paragraph(f'<font color="white"><b>{"NET PROFIT" if good else "NET LOSS"}</b></font>',
+                               ParagraphStyle("b1", parent=st["cell"], fontSize=10, leading=13)),
+                     Paragraph(f'<font color="white"><b>{escape(_rs(net))}</b></font>',
+                               ParagraphStyle("b2", parent=st["cellr"], fontSize=14, leading=17))]],
+                   colWidths=[width * 0.5, width * 0.5])
+    banner.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colr), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10)]))
+    return [t, Spacer(1, 5), banner]
+
+
+def export_report_pdf(date_from, date_to, path):
+    """Business report PDF (A4 portrait). A single day also gets the day's stock ledger."""
+    data = _collect(date_from, date_to)
+    a, b, s, shop = data["from"], data["to"], data["summary"], data["shop"]
+    st = _styles()
+    width = A4[0] - 3 * cm
+    generated = datetime.datetime.now().strftime("%d-%m-%Y %H:%M")
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.HexColor(MUTED))
+        canvas.setStrokeColor(colors.HexColor(RULE))
+        canvas.line(1.5 * cm, 1.15 * cm, A4[0] - 1.5 * cm, 1.15 * cm)
+        canvas.drawString(1.5 * cm, 0.7 * cm, f"Generated on {generated}")
+        canvas.drawRightString(A4[0] - 1.5 * cm, 0.7 * cm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(str(path), pagesize=A4, leftMargin=1.5 * cm, rightMargin=1.5 * cm,
+                            topMargin=1.5 * cm, bottomMargin=1.7 * cm,
+                            title=f"{shop['name']} - Business report", author=shop["name"])
+    story = []
+    contact = " · ".join(x for x in (f"Phone {shop['phone']}" if shop["phone"] else "",
+                                      f"GSTIN {shop['gstin']}" if shop["gstin"] else "") if x)
+    left = [_p(shop["name"], st["shop"])] + [_p(m, st["meta"]) for m in (shop["address"], contact) if m]
+    head = Table([[left, [_p("Business report", st["title"]), _p(_period_text(a, b), st["period"])]]],
+                 colWidths=[width * 0.58, width * 0.42])
+    head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                              ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                              ("LINEBELOW", (0, 0), (-1, 0), 1.2, colors.HexColor(BRAND)),
+                              ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+    story += [head, Spacer(1, 10)]
+    story += _kpi_block(s, st, width)
+
+    # Sales
+    story += [CondPageBreak(4 * cm), _p("Sales", st["h"])]
+    sales = data["sales"]
+    if not sales:
+        story.append(_p("No sales in this period.", st["empty"]))
+    elif len(sales) <= MAX_ITEMISED:
+        single = data["single"]
+        rows = [([] if single else [format_date(r["date"], "%d-%m")]) +
+                [r["bill_no"] or "", _p(_product_text(r), st["cell"]), format_qty(r["qty"]),
+                 _rs(r["unit_price"]), _rs(r["cost"]), _rs(r["amount"]), _rs(r["margin"])] for r in sales]
+        tot = (["Total", ""] if single else ["Total", "", ""]) + [
+            format_qty(sum(r["qty"] for r in sales)), "", _rs(sum(r["cost_amount"] for r in sales)),
+            _rs(sum(r["amount"] for r in sales)), _rs(sum(r["margin"] for r in sales))]
+        lead = [] if single else [1.3 * cm]
+        fixed = [1.7 * cm, 1.5 * cm, 2.45 * cm, 2.45 * cm, 2.6 * cm, 2.4 * cm]   # bill, qty, rate, cost, amount, margin
+        widths = lead + [fixed[0], width - sum(lead) - sum(fixed)] + fixed[1:]
+        headers = ([] if single else ["Date"]) + ["Bill", "Product", "Qty", "Rate", "Cost", "Amount", "Margin"]
+        k = len(lead)
+        story.append(_table(headers, rows, widths, st, right=tuple(range(k + 2, k + 7)), total=tot))
+        story += _net_sales(s, st)
+    else:
+        story.append(_p(f"{len(sales)} lines in this period, so they are summarised by product. "
+                        f"Sales {_rs(sum(r['revenue'] for r in data['products']))} before "
+                        f"{_rs(s['discount'])} discounts.", st["note"]))
+        story.append(_product_table(data["products"], st))
+        story += _net_sales(s, st)
+
+    # Purchases
+    story += [CondPageBreak(4 * cm), _p("Purchases", st["h"])]
+    purchases = data["purchases"]
+    if not purchases:
+        story.append(_p("No purchases in this period.", st["empty"]))
+    elif len(purchases) <= MAX_ITEMISED:
+        rows = [[format_date(r["date"]), r["bill_no"] or "", _p(r["party_name"] or "", st["cell"]),
+                 _p(_product_text(r), st["cell"]), format_qty(r["qty"]),
+                 _rs(r["unit_price"]), _rs(r["amount"])] for r in purchases]
+        tot = ["Total", "", "", "", format_qty(sum(r["qty"] for r in purchases)), "",
+               _rs(sum(r["amount"] for r in purchases))]
+        story.append(_table(["Date", "Bill", "Supplier", "Product", "Qty", "Rate", "Amount"], rows,
+                            [2.0 * cm, 1.6 * cm, 2.8 * cm, 4.6 * cm, 1.5 * cm, 2.5 * cm, 3.0 * cm],
+                            st, right=(4, 5, 6), total=tot))
+    else:
+        story.append(_p(f"{len(purchases)} lines in this period, so they are summarised by product.", st["note"]))
+        agg = _purchase_by_product(purchases)
+        rows = [[_p(x["product"], st["cell"]), format_qty(x["qty"], x["unit"]), _rs(x["amount"])] for x in agg]
+        story.append(_table(["Product", "Qty bought", "Amount"], rows, [10 * cm, 3.5 * cm, 4.5 * cm], st,
+                            right=(1, 2), total=["Total", format_qty(sum(x["qty"] for x in agg)),
+                                                 _rs(sum(x["amount"] for x in agg))]))
+
+    # Expenses
+    story += [CondPageBreak(4 * cm), _p("Expenses", st["h"])]
+    exps = data["expenses"]
+    if not exps:
+        story.append(_p("No expenses in this period.", st["empty"]))
+    else:
+        rows = [[format_date(r["date"]), _p(r["category"], st["cell"]), _p(r["note"] or "", st["cell"]),
+                 _rs(r["amount"])] for r in exps]
+        story.append(_table(["Date", "Category", "Note", "Amount"], rows,
+                            [2.0 * cm, 4.0 * cm, 8.5 * cm, 3.5 * cm], st, right=(3,),
+                            total=["Total", "", "", _rs(sum(r["amount"] for r in exps))]))
+
+    # Day stock
+    if data["ledger"] is not None:
+        story += [CondPageBreak(4 * cm), _p("Stock for the day", st["h"])]
+        led = data["ledger"]
+        if not led:
+            story.append(_p("No products to show.", st["empty"]))
+        else:
+            rows = [[_p(_product_text(r), st["cell"]), format_qty(r["opening_stock"]),
+                     format_qty(r["purchases_qty"]), format_qty(r["sales_qty"]),
+                     format_qty(r["closing_stock"], r.get("product_unit")), _ledger_note(r)] for r in led]
+            story.append(_table(["Product", "Opening", "In", "Out", "Closing", "Note"], rows,
+                                [7.0 * cm, 2.0 * cm, 1.8 * cm, 1.8 * cm, 2.9 * cm, 2.5 * cm], st,
+                                right=(1, 2, 3, 4)))
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return str(path)
+
+
+def _net_sales(s, st):
+    """'Less: discounts' and 'Net sales' lines under the sales table; net equals the Sales KPI."""
+    bold = ParagraphStyle("nsb", parent=st["cellr"], fontName="Helvetica-Bold")
+    t = Table([[_p("Less: discounts", st["cellr"]), _p(_rs(-abs(s["discount"])), st["cellr"])],
+               [_p("Net sales", bold), _p(_rs(s["revenue"]), bold)]], colWidths=[4 * cm, 3.4 * cm], hAlign="RIGHT")
+    t.setStyle(TableStyle([("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                           ("LINEABOVE", (0, 1), (-1, 1), 0.6, colors.HexColor(INK))]))
+    return [Spacer(1, 3), t]
+
+
+def _product_table(perf, st):
+    rows = [[_p(_product_text(r), st["cell"]), format_qty(r["qty"], r.get("product_unit")), _rs(r["revenue"]),
+             _rs(r["cost"]), _rs(r["profit"]), f"{r['margin_pct']:.1f}%"] for r in perf]
+    tot = ["Total", "", _rs(sum(r["revenue"] for r in perf)), _rs(sum(r["cost"] for r in perf)),
+           _rs(sum(r["profit"] for r in perf)), ""]
+    return _table(["Product", "Qty", "Sales", "Cost", "Profit", "Margin %"], rows,
+                  [6.2 * cm, 2.2 * cm, 2.7 * cm, 2.7 * cm, 2.5 * cm, 1.7 * cm], st, right=(1, 2, 3, 4, 5), total=tot)
+
+
+# ── Excel ───────────────────────────────────────────────────────────────
+_HEAD_FILL = PatternFill("solid", start_color="BA7517", end_color="BA7517")
+_HEAD_FONT = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+_TOTAL_FILL = PatternFill("solid", start_color="F3EEE3", end_color="F3EEE3")
+_THIN = Side(style="thin", color="D8D2C6")
+
+
+def _sheet(wb, title, headers, rows, money=(), total=None, widths=None, first=False):
+    """Header row + data rows (+ totals row as values). ``money`` = 0-based numeric columns."""
+    ws = wb.active if first else wb.create_sheet()
+    ws.title = title
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font, cell.fill = _HEAD_FONT, _HEAD_FILL
+        cell.alignment = Alignment(horizontal="center" if cell.column - 1 not in money else "right",
+                                   vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 24
+    for r in rows:
+        ws.append(list(r))
+    if total:
+        ws.append(list(total))
+        for cell in ws[ws.max_row]:
+            cell.font, cell.fill = Font(name="Calibri", size=11, bold=True), _TOTAL_FILL
+            cell.border = Border(top=Side(style="medium", color="1F1E1B"))
+    for row in ws.iter_rows(min_row=2):
+        for i, cell in enumerate(row):
+            if i in money and isinstance(cell.value, (int, float)):
+                cell.number_format = NUM_FMT
+                cell.alignment = Alignment(horizontal="right")
+    ws.freeze_panes = "A2"
+    for i, h in enumerate(headers):
+        longest = max([len(str(h))] + [len(str(r[i])) for r in rows if i < len(r) and r[i] is not None] + [0])
+        ws.column_dimensions[get_column_letter(i + 1)].width = (widths[i] if widths else
+                                                                 min(46, max(11, longest + 3)))
+    return ws
+
+
+def export_report_excel(date_from, date_to, path):
+    data = _collect(date_from, date_to)
+    a, b, s = data["from"], data["to"], data["summary"]
+    wb = openpyxl.Workbook()
+
+    summary_rows = [
+        ("Shop", data["shop"]["name"]), ("Period", _period_text(a, b)),
+        ("Sales", s["revenue"]), ("Cost of goods sold", s["cost"]), ("Discounts given", s["discount"]),
+        ("Gross profit", s["gross_profit"]), ("Margin %", s["margin_pct"]), ("Expenses", s["expenses"]),
+        ("Net profit", s["net_profit"]), ("Purchases", s["purchases"]),
+        ("Collected from customers", s["collected"]), ("Paid to suppliers", s["paid_out"]),
+        ("Sale bills", s["sale_bills"]), ("Quantity sold", s["qty_sold"]),
+        ("Purchase bills", s["purchase_bills"]), ("Quantity purchased", s["qty_purchased"]),
+    ]
+    ws = _sheet(wb, "Summary", ["Item", "Value"], summary_rows, money=(1,), widths=[30, 26], first=True)
+    for row in ws.iter_rows(min_row=2):
+        if row[0].value in ("Sale bills", "Purchase bills"):
+            row[1].number_format = "0"
+        elif row[0].value in ("Net profit", "Gross profit", "Sales"):
+            row[0].font = row[1].font = Font(name="Calibri", size=11, bold=True)
+        if row[0].value in ("Shop", "Period"):
+            row[1].alignment = Alignment(horizontal="left")
+
+    sales = data["sales"]
+    _sheet(wb, "Sales", ["Date", "Bill", "Customer", "Product", "Qty", "Rate", "Cost", "Amount", "Margin"],
+           [(r["date"], r["bill_no"], r["party_name"] or "", _product_text(r), r["qty"], r["unit_price"],
+             r["cost"], r["amount"], r["margin"]) for r in sales], money=(4, 5, 6, 7, 8),
+           total=("Total", "", "", "", sum(r["qty"] for r in sales), "", sum(r["cost_amount"] for r in sales),
+                  round(sum(r["amount"] for r in sales), 2), round(sum(r["margin"] for r in sales), 2)),
+           widths=[12, 12, 22, 36, 10, 12, 12, 14, 14])
+    wsx = wb["Sales"]
+    for label_, val in (("Less: discounts", -s["discount"]), ("Net sales", s["revenue"])):
+        wsx.append([label_, "", "", "", "", "", "", val])
+        for cell in wsx[wsx.max_row]:
+            cell.font = Font(name="Calibri", size=11, bold=label_ == "Net sales")
+        wsx.cell(wsx.max_row, 8).number_format = NUM_FMT
+    purchases = data["purchases"]
+    _sheet(wb, "Purchases", ["Date", "Bill", "Supplier", "Product", "Qty", "Rate", "Amount"],
+           [(r["date"], r["bill_no"], r["party_name"] or "", _product_text(r), r["qty"], r["unit_price"],
+             r["amount"]) for r in purchases], money=(4, 5, 6),
+           total=("Total", "", "", "", sum(r["qty"] for r in purchases), "",
+                  round(sum(r["amount"] for r in purchases), 2)),
+           widths=[12, 12, 22, 36, 10, 12, 14])
+    exps = data["expenses"]
+    _sheet(wb, "Expenses", ["Date", "Category", "Note", "Amount"],
+           [(r["date"], r["category"], r["note"] or "", r["amount"]) for r in exps], money=(3,),
+           total=("Total", "", "", round(sum(r["amount"] for r in exps), 2)), widths=[12, 22, 44, 14])
+    perf = data["products"]
+    _sheet(wb, "Products", ["Product", "Qty sold", "Sales", "Cost", "Profit", "Margin %"],
+           [(_product_text(r), r["qty"], r["revenue"], r["cost"], r["profit"], r["margin_pct"]) for r in perf],
+           money=(1, 2, 3, 4, 5),
+           total=("Total", sum(r["qty"] for r in perf), round(sum(r["revenue"] for r in perf), 2),
+                  round(sum(r["cost"] for r in perf), 2), round(sum(r["profit"] for r in perf), 2), ""),
+           widths=[40, 12, 14, 14, 14, 11])
+    daily = data["daily"]
+    _sheet(wb, "Daily", ["Date", "Sales", "Gross profit", "Expenses", "Net profit"],
+           [(d["date"], d["revenue"], d["gross_profit"], d["expenses"], d["net_profit"]) for d in daily],
+           money=(1, 2, 3, 4),
+           total=("Total", round(sum(d["revenue"] for d in daily), 2), round(sum(d["gross_profit"] for d in daily), 2),
+                  round(sum(d["expenses"] for d in daily), 2), round(sum(d["net_profit"] for d in daily), 2)),
+           widths=[12, 14, 14, 14, 14])
+    if data["ledger"] is not None:
+        led = data["ledger"]
+        _sheet(wb, "Stock", ["Product", "Opening", "In", "Out", "Closing", "Note"],
+               [(_product_text(r), r["opening_stock"], r["purchases_qty"], r["sales_qty"], r["closing_stock"],
+                 _ledger_note(r)) for r in led], money=(1, 2, 3, 4), widths=[40, 12, 12, 12, 12, 12])
+    else:
+        items = data["stock"]["items"]
+        _sheet(wb, "Stock", ["Product", "In stock", "Cost", "Stock value at cost", "Value at selling price",
+                             "Status"],
+               [(_product_text(p, ""), p["stock"], p["purchase_price"], p["stock_value"],
+                 round(p["stock"] * p["selling_price"], 2),
+                 {"ok": "OK", "low": "Low", "out": "Out of stock"}.get(p["status"], p["status"])) for p in items],
+               money=(1, 2, 3, 4),
+               total=("Total", "", "", data["stock"]["stock_value"], data["stock"]["retail_value"], ""),
+               widths=[40, 12, 12, 20, 22, 14])
+    wb.save(str(path))
+    return str(path)
+
+
+# ── backwards-compatible wrappers ───────────────────────────────────────
+def export_daily_pdf(date_str, filepath):
+    return export_report_pdf(date_str, date_str, filepath)
+
 
 def export_daily_excel(date_str, filepath):
-    """Generates a highly-stylized, professional Excel spreadsheet workbook
-    containing Daily Financial Summaries, Sales Margin Logs, Expenses, and Stock Reconciliation Ledger.
-    """
-    # Fetch Data
-    sales = sale_model.get_sales_by_date(date_str)
-    expenses = expense_model.get_expenses_by_date(date_str)
-    ledger = ledger_model.get_ledger_for_date(date_str)
-
-    wb = openpyxl.Workbook()
-    
-    # ----------------------------------------------------
-    # STYLE DEFINITIONS
-    # ----------------------------------------------------
-    font_family = "Segoe UI"
-    
-    # Fonts
-    title_font = Font(name=font_family, size=16, bold=True, color="FFFFFF")
-    header_font = Font(name=font_family, size=11, bold=True, color="FFFFFF")
-    kpi_title_font = Font(name=font_family, size=9, bold=True, color="808080")
-    kpi_value_font = Font(name=font_family, size=14, bold=True, color="000000")
-    bold_font = Font(name=font_family, size=10, bold=True, color="000000")
-    regular_font = Font(name=font_family, size=10, color="000000")
-    italic_font = Font(name=font_family, size=10, italic=True, color="555555")
-
-    # Fills
-    brand_fill = PatternFill(start_color="BA7517", end_color="BA7517", fill_type="solid") # Amber
-    header_fill = PatternFill(start_color="1F1E1B", end_color="1F1E1B", fill_type="solid") # Dark Charcoal
-    zebra_fill = PatternFill(start_color="F9F9F8", end_color="F9F9F8", fill_type="solid") # Light grayish alternate
-    kpi_fill = PatternFill(start_color="F4F2EE", end_color="F4F2EE", fill_type="solid") # Soft card fill
-    profit_fill = PatternFill(start_color="E8F8F5", end_color="E8F8F5", fill_type="solid") # Soft green
-    loss_fill = PatternFill(start_color="FDEDEC", end_color="FDEDEC", fill_type="solid") # Soft red
-
-    # Borders
-    thin_border_side = Side(border_style="thin", color="CCCCCC")
-    double_border_side = Side(border_style="double", color="333333")
-    thick_border_side = Side(border_style="medium", color="BA7517")
-    
-    cell_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
-    summary_border = Border(top=thin_border_side, bottom=double_border_side)
-    kpi_border = Border(left=thin_border_side, right=thin_border_side, top=thick_border_side, bottom=thin_border_side)
-
-    # ----------------------------------------------------
-    # SHEET 1: Financial & Sales Summary
-    # ----------------------------------------------------
-    ws_sales = wb.active
-    ws_sales.title = "Sales & Margins"
-    ws_sales.views.sheetView[0].showGridLines = True
-
-    # Title block
-    ws_sales.merge_cells("A1:M1")
-    title_cell = ws_sales["A1"]
-    title_cell.value = f"DAILY SALES & PROFITS MARGIN BREAKDOWN — {helpers.format_date(date_str)}"
-    title_cell.font = title_font
-    title_cell.fill = brand_fill
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws_sales.row_dimensions[1].height = 40
-
-    # Stat Cards / KPI Blocks
-    total_qty = sum(s['qty'] for s in sales)
-    total_rev = sum(s['total_revenue'] for s in sales)
-    total_gp = sum(s['margin_profit'] for s in sales)
-    total_exp = sum(e['amount'] for e in expenses)
-    net_profit = total_gp - total_exp
-
-    kpi_data = [
-        ("Volume Sold", f"{total_qty:.1f} Units", "B3:C4"),
-        ("Gross Sales Revenue", total_rev, "E3:F4"),
-        ("Gross Margin Profit", total_gp, "H3:I4"),
-        ("Daily Expenditures", total_exp, "K3:L4")
-    ]
-
-    for label, val, cells_range in kpi_data:
-        start_cell_ref, end_cell_ref = cells_range.split(":")
-        start_col = start_cell_ref[0]
-        end_col = end_cell_ref[0]
-        
-        # Label in top row (row 3)
-        ws_sales[f"{start_col}3"].value = label.upper()
-        ws_sales[f"{start_col}3"].font = kpi_title_font
-        ws_sales[f"{start_col}3"].alignment = Alignment(horizontal="center", vertical="center")
-        ws_sales.merge_cells(f"{start_col}3:{end_col}3")
-        
-        # Value in bottom row (row 4)
-        val_cell = ws_sales[f"{start_col}4"]
-        val_cell.value = val
-        val_cell.font = kpi_value_font
-        val_cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws_sales.merge_cells(f"{start_col}4:{end_col}4")
-        
-        if isinstance(val, (int, float)):
-            val_cell.number_format = '"₹"#,##,##0.00'
-        
-        # Apply border & fills
-        start_c, start_r = openpyxl.utils.coordinate_to_tuple(start_cell_ref)
-        end_c, end_r = openpyxl.utils.coordinate_to_tuple(end_cell_ref)
-        for r in range(start_r, end_r + 1):
-            for c in range(start_c, end_c + 1):
-                cell = ws_sales.cell(row=r, column=c)
-                cell.fill = kpi_fill
-                cell.border = kpi_border
-                
-    ws_sales.row_dimensions[3].height = 18
-    ws_sales.row_dimensions[4].height = 25
-    
-    # Net Profit Card Banner
-    ws_sales.merge_cells("B5:L5")
-    np_cell = ws_sales["B5"]
-    np_cell.value = f"TOTAL DAILY NET BUSINESS PROFIT:   " + helpers.format_currency(net_profit)
-    np_cell.font = Font(name=font_family, size=11, bold=True, color="000000")
-    np_cell.alignment = Alignment(horizontal="center", vertical="center")
-    np_cell.fill = profit_fill if net_profit >= 0 else loss_fill
-    ws_sales.row_dimensions[5].height = 25
-    for c in range(2, 13):
-        ws_sales.cell(row=5, column=c).border = cell_border
-        ws_sales.cell(row=5, column=c).fill = profit_fill if net_profit >= 0 else loss_fill
-
-    # Sales Table Header
-    sales_headers = [
-        "Product Name", "Brand", "Type", "Thickness", "Size", "Qty Sold", "Unit", 
-        "Selling Rate", "Cost Rate", "Total Revenue", "Total Cost Price", "Gross Margin Profit", "Customer & Notes"
-    ]
-    
-    start_row_sales = 8
-    ws_sales.row_dimensions[start_row_sales].height = 25
-    
-    for idx, name in enumerate(sales_headers, start=1):
-        cell = ws_sales.cell(row=start_row_sales, column=idx)
-        cell.value = name
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="left" if idx in [1,2,13] else "right", vertical="center")
-        cell.border = cell_border
-
-    # Data Rows
-    current_row = start_row_sales + 1
-    for idx, s in enumerate(sales):
-        ws_sales.row_dimensions[current_row].height = 20
-        fill_row = zebra_fill if idx % 2 == 1 else PatternFill(fill_type=None)
-        
-        # Product specifications
-        ws_sales.cell(row=current_row, column=1, value=s['product_name']).font = bold_font
-        ws_sales.cell(row=current_row, column=2, value=s['product_brand']).font = regular_font
-        ws_sales.cell(row=current_row, column=3, value=s['product_type']).font = regular_font
-        ws_sales.cell(row=current_row, column=4, value=s['product_thickness']).font = regular_font
-        ws_sales.cell(row=current_row, column=5, value=s['product_size']).font = regular_font
-        
-        # Quantity & Unit
-        ws_sales.cell(row=current_row, column=6, value=s['qty']).font = bold_font
-        ws_sales.cell(row=current_row, column=6).number_format = '#,##0.0'
-        ws_sales.cell(row=current_row, column=7, value=s['product_unit']).font = regular_font
-        
-        # Prices
-        ws_sales.cell(row=current_row, column=8, value=s['unit_price']).font = regular_font
-        ws_sales.cell(row=current_row, column=8).number_format = '"₹"#,##,##0.00'
-        ws_sales.cell(row=current_row, column=9, value=s['purchase_price_at_time']).font = regular_font
-        ws_sales.cell(row=current_row, column=9).number_format = '"₹"#,##,##0.00'
-        
-        # Computations (via Excel formulas for clean values!)
-        # Total Revenue = Qty * Selling Rate
-        ws_sales.cell(row=current_row, column=10, value=f"=F{current_row}*H{current_row}").font = bold_font
-        ws_sales.cell(row=current_row, column=10).number_format = '"₹"#,##,##0.00'
-        
-        # Total Cost = Qty * Cost Rate
-        ws_sales.cell(row=current_row, column=11, value=f"=F{current_row}*I{current_row}").font = regular_font
-        ws_sales.cell(row=current_row, column=11).number_format = '"₹"#,##,##0.00'
-        
-        # Profit Margin = Total Revenue - Total Cost
-        ws_sales.cell(row=current_row, column=12, value=f"=J{current_row}-K{current_row}").font = bold_font
-        ws_sales.cell(row=current_row, column=12).number_format = '"₹"#,##,##0.00'
-        
-        # Customer Note
-        note_str = s['customer_name'] or ""
-        if s['notes']:
-            note_str += f" ({s['notes']})"
-        ws_sales.cell(row=current_row, column=13, value=note_str).font = italic_font
-        
-        # Alignments & Borders
-        for c in range(1, 14):
-            cell = ws_sales.cell(row=current_row, column=c)
-            cell.border = cell_border
-            if fill_row.fill_type:
-                cell.fill = fill_row
-            if c not in [1, 2, 13]:
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-            else:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
-
-        current_row += 1
-
-    # Total row at bottom
-    if sales:
-        ws_sales.row_dimensions[current_row].height = 24
-        # Total text
-        ws_sales.cell(row=current_row, column=1, value="GRAND TOTALS").font = Font(name=font_family, size=10, bold=True, color="BA7517")
-        # Formula sums
-        ws_sales.cell(row=current_row, column=6, value=f"=SUM(F9:F{current_row-1})").font = bold_font
-        ws_sales.cell(row=current_row, column=6).number_format = '#,##0.0'
-        
-        ws_sales.cell(row=current_row, column=10, value=f"=SUM(J9:J{current_row-1})").font = bold_font
-        ws_sales.cell(row=current_row, column=10).number_format = '"₹"#,##,##0.00'
-        
-        ws_sales.cell(row=current_row, column=11, value=f"=SUM(K9:K{current_row-1})").font = bold_font
-        ws_sales.cell(row=current_row, column=11).number_format = '"₹"#,##,##0.00'
-        
-        ws_sales.cell(row=current_row, column=12, value=f"=SUM(L9:L{current_row-1})").font = bold_font
-        ws_sales.cell(row=current_row, column=12).number_format = '"₹"#,##,##0.00'
-        
-        for c in range(1, 14):
-            cell = ws_sales.cell(row=current_row, column=c)
-            cell.border = summary_border
-            cell.fill = kpi_fill
-            if c not in [1, 2, 13]:
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-
-    # ----------------------------------------------------
-    # SHEET 2: Operating Expenditures
-    # ----------------------------------------------------
-    ws_exp = wb.create_sheet(title="Operating Expenses")
-    ws_exp.views.sheetView[0].showGridLines = True
-
-    # Title Block
-    ws_exp.merge_cells("A1:C1")
-    title_exp = ws_exp["A1"]
-    title_exp.value = f"DAILY BUSINESS OPERATING EXPENDITURES — {helpers.format_date(date_str)}"
-    title_exp.font = title_font
-    title_exp.fill = brand_fill
-    title_exp.alignment = Alignment(horizontal="center", vertical="center")
-    ws_exp.row_dimensions[1].height = 40
-
-    # Table Headers
-    exp_headers = ["Expenditure Category", "Amount", "Note / Detailed Explanation"]
-    ws_exp.row_dimensions[3].height = 25
-    for idx, name in enumerate(exp_headers, start=1):
-        cell = ws_exp.cell(row=3, column=idx)
-        cell.value = name
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="left" if idx in [1,3] else "right", vertical="center")
-        cell.border = cell_border
-
-    # Data Rows
-    current_row_exp = 4
-    for idx, e in enumerate(expenses):
-        ws_exp.row_dimensions[current_row_exp].height = 20
-        fill_row = zebra_fill if idx % 2 == 1 else PatternFill(fill_type=None)
-        
-        ws_exp.cell(row=current_row_exp, column=1, value=e['category']).font = bold_font
-        ws_exp.cell(row=current_row_exp, column=2, value=e['amount']).font = Font(name=font_family, size=10, bold=True, color="C0392B") # red text
-        ws_exp.cell(row=current_row_exp, column=2).number_format = '"₹"#,##,##0.00'
-        ws_exp.cell(row=current_row_exp, column=3, value=e['note'] or "-").font = regular_font
-        
-        for c in range(1, 4):
-            cell = ws_exp.cell(row=current_row_exp, column=c)
-            cell.border = cell_border
-            if fill_row.fill_type:
-                cell.fill = fill_row
-            if c == 2:
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-            else:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
-        current_row_exp += 1
-
-    # Total Row
-    if expenses:
-        ws_exp.row_dimensions[current_row_exp].height = 24
-        ws_exp.cell(row=current_row_exp, column=1, value="TOTAL OPERATING EXPENDITURES").font = Font(name=font_family, size=10, bold=True, color="C0392B")
-        ws_exp.cell(row=current_row_exp, column=2, value=f"=SUM(B4:B{current_row_exp-1})").font = Font(name=font_family, size=11, bold=True, color="C0392B")
-        ws_exp.cell(row=current_row_exp, column=2).number_format = '"₹"#,##,##0.00'
-        
-        for c in range(1, 4):
-            cell = ws_exp.cell(row=current_row_exp, column=c)
-            cell.border = summary_border
-            cell.fill = kpi_fill
-            if c == 2:
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-
-    # ----------------------------------------------------
-    # SHEET 3: Stock Ledger Reconciliation
-    # ----------------------------------------------------
-    ws_led = wb.create_sheet(title="Inventory Reconciliation")
-    ws_led.views.sheetView[0].showGridLines = True
-
-    # Title Block
-    ws_led.merge_cells("A1:I1")
-    title_led = ws_led["A1"]
-    title_led.value = f"INVENTORY RECONCILIATION & STOCK LEDGER — {helpers.format_date(date_str)}"
-    title_led.font = title_font
-    title_led.fill = brand_fill
-    title_led.alignment = Alignment(horizontal="center", vertical="center")
-    ws_led.row_dimensions[1].height = 40
-
-    # Headers
-    led_headers = [
-        "Product Specifications", "Brand", "Thickness", "Dimensions Size", 
-        "Opening Stock", "Purchases (+)", "Sales (-)", "Closing Stock", "Reconciliation Status"
-    ]
-    ws_led.row_dimensions[3].height = 25
-    for idx, name in enumerate(led_headers, start=1):
-        cell = ws_led.cell(row=3, column=idx)
-        cell.value = name
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="left" if idx in [1,2,9] else "right", vertical="center")
-        cell.border = cell_border
-
-    # Data Rows
-    current_row_led = 4
-    for idx, row in enumerate(ledger):
-        ws_led.row_dimensions[current_row_led].height = 20
-        fill_row = zebra_fill if idx % 2 == 1 else PatternFill(fill_type=None)
-        
-        # Product Specs
-        ws_led.cell(row=current_row_led, column=1, value=row['product_name']).font = bold_font
-        ws_led.cell(row=current_row_led, column=2, value=row['product_brand']).font = regular_font
-        ws_led.cell(row=current_row_led, column=3, value=row['product_thickness']).font = regular_font
-        ws_led.cell(row=current_row_led, column=4, value=row['product_size']).font = regular_font
-        
-        # Quantities
-        ws_led.cell(row=current_row_led, column=5, value=row['opening_stock']).font = regular_font
-        ws_led.cell(row=current_row_led, column=5).number_format = f'#,##0.0" {row["product_unit"]}"'
-        
-        ws_led.cell(row=current_row_led, column=6, value=row['purchases_qty']).font = regular_font
-        ws_led.cell(row=current_row_led, column=6).number_format = f'#,##0.0" {row["product_unit"]}"'
-        
-        ws_led.cell(row=current_row_led, column=7, value=row['sales_qty']).font = regular_font
-        ws_led.cell(row=current_row_led, column=7).number_format = f'#,##0.0" {row["product_unit"]}"'
-        
-        # Closing Stock (Formula-based or overridden value)
-        if row['manual_override'] == 1:
-            ws_led.cell(row=current_row_led, column=8, value=row['closing_stock']).font = Font(name=font_family, size=10, bold=True, color="3498DB")
-        else:
-            ws_led.cell(row=current_row_led, column=8, value=f"=E{current_row_led}+F{current_row_led}-G{current_row_led}").font = bold_font
-        ws_led.cell(row=current_row_led, column=8).number_format = f'#,##0.0" {row["product_unit"]}"'
-        
-        # Status Label
-        if row['is_confirmed'] == 1:
-            status_desc = "LOCKED"
-            status_text_color = "27AE60" # green
-        elif row['manual_override'] == 1:
-            status_desc = f"ADJUSTED"
-            if row['override_note']:
-                status_desc += f" ({row['override_note']})"
-            status_text_color = "2980B9" # blue
-        else:
-            status_desc = "UNLOCKED"
-            status_text_color = "D35400" # orange
-            
-        status_cell = ws_led.cell(row=current_row_led, column=9, value=status_desc)
-        status_cell.font = Font(name=font_family, size=9, bold=True, color=status_text_color)
-        
-        for c in range(1, 10):
-            cell = ws_led.cell(row=current_row_led, column=c)
-            cell.border = cell_border
-            if fill_row.fill_type:
-                cell.fill = fill_row
-            if c not in [1, 2, 9]:
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-            else:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
-        current_row_led += 1
-
-    # ----------------------------------------------------
-    # COLUMN WIDTH AUTO-FITTER (ALL SHEETS)
-    # ----------------------------------------------------
-    for ws in [ws_sales, ws_exp, ws_led]:
-        for col in ws.columns:
-            max_len = 0
-            col_letter = get_column_letter(col[0].column)
-            
-            # Skip checking values in row 1 & row 3-4 (KPIs) to prevent oversized columns
-            for cell in col:
-                if cell.row in [1, 3, 4, 5]:
-                    continue
-                val_str = str(cell.value or "")
-                if cell.number_format and "₹" in cell.number_format:
-                    val_str = "Rs." + val_str # rough length fallback
-                max_len = max(max_len, len(val_str))
-                
-            ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
-
-    # Save Workbook
-    wb.save(filepath)
-    return True
-
-
-def export_daily_pdf(date_str, filepath):
-    """Generates a high-fidelity, styled business PDF summary report utilizing ReportLab.
-    Ensures safe font representations (uses 'Rs.' in place of unicode '₹' to prevent system rendering errors).
-    """
-    # Fetch Data
-    sales = sale_model.get_sales_by_date(date_str)
-    expenses = expense_model.get_expenses_by_date(date_str)
-    ledger = ledger_model.get_ledger_for_date(date_str)
-
-    # Computations
-    total_qty = sum(s['qty'] for s in sales)
-    total_rev = sum(s['total_revenue'] for s in sales)
-    total_gp = sum(s['margin_profit'] for s in sales)
-    total_exp = sum(e['amount'] for e in expenses)
-    net_profit = total_gp - total_exp
-
-    # Set up Document
-    # A4 Page dimensions: 595.27 x 841.89 points
-    doc = SimpleDocTemplate(
-        filepath,
-        pagesize=A4,
-        rightMargin=1.5*cm,
-        leftMargin=1.5*cm,
-        topMargin=1.5*cm,
-        bottomMargin=1.5*cm
-    )
-    
-    styles = getSampleStyleSheet()
-    
-    # Custom Palette
-    c_brand = colors.HexColor("#BA7517")
-    c_dark = colors.HexColor("#1F1E1B")
-    c_light = colors.HexColor("#F9F9F8")
-    c_border = colors.HexColor("#E5E2DB")
-    c_accent_green = colors.HexColor("#27AE60")
-    c_accent_red = colors.HexColor("#C0392B")
-
-    # Typography Styles
-    style_letterhead = ParagraphStyle(
-        'Letterhead', parent=styles['Normal'],
-        fontName='Helvetica-Bold', fontSize=18, textColor=colors.white,
-        alignment=1, spaceAfter=2
-    )
-    
-    style_subtitle = ParagraphStyle(
-        'Subtitle', parent=styles['Normal'],
-        fontName='Helvetica-Oblique', fontSize=11, textColor=colors.HexColor("#DCDAD5"),
-        alignment=1
-    )
-
-    style_h1 = ParagraphStyle(
-        'H1', parent=styles['Heading1'],
-        fontName='Helvetica-Bold', fontSize=12, textColor=c_dark,
-        spaceBefore=14, spaceAfter=6, keepWithNext=True
-    )
-
-    style_cell_header = ParagraphStyle(
-        'CellHeader', parent=styles['Normal'],
-        fontName='Helvetica-Bold', fontSize=8, textColor=colors.white,
-        alignment=0
-    )
-    
-    style_cell_header_right = ParagraphStyle(
-        'CellHeaderRight', parent=style_cell_header,
-        alignment=2
-    )
-
-    style_cell_normal = ParagraphStyle(
-        'CellNormal', parent=styles['Normal'],
-        fontName='Helvetica', fontSize=8, textColor=colors.HexColor("#2C2A29"),
-        leading=10
-    )
-    
-    style_cell_bold = ParagraphStyle(
-        'CellBold', parent=style_cell_normal,
-        fontName='Helvetica-Bold'
-    )
-    
-    style_cell_right = ParagraphStyle(
-        'CellRight', parent=style_cell_normal,
-        alignment=2
-    )
-
-    style_cell_right_bold = ParagraphStyle(
-        'CellRightBold', parent=style_cell_right,
-        fontName='Helvetica-Bold'
-    )
-
-    style_kpi_label = ParagraphStyle(
-        'KpiLabel', parent=styles['Normal'],
-        fontName='Helvetica-Bold', fontSize=8, textColor=colors.HexColor("#808080"),
-        alignment=1
-    )
-
-    style_kpi_value = ParagraphStyle(
-        'KpiValue', parent=styles['Normal'],
-        fontName='Helvetica-Bold', fontSize=12, textColor=colors.black,
-        alignment=1
-    )
-
-    story = []
-
-    # ----------------------------------------------------
-    # Header Banner (Letterhead)
-    # ----------------------------------------------------
-    header_data = [
-        [Paragraph("PLYWOODPRO INVENTORY SYSTEM", style_letterhead)],
-        [Paragraph(f"Daily Business Performance & Reconciliation Report — {helpers.format_date(date_str)}", style_subtitle)]
-    ]
-    header_table = Table(header_data, colWidths=[18*cm])
-    header_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), c_brand),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('BOTTOMPADDING', (0,0), (-1,0), 0),
-        ('TOPPADDING', (0,0), (-1,-1), 10),
-        ('BOTTOMPADDING', (0,1), (-1,-1), 10),
-    ]))
-    story.append(header_table)
-    story.append(Spacer(1, 0.4*cm))
-
-    # ----------------------------------------------------
-    # KPI Performance Summary Block
-    # ----------------------------------------------------
-    kpi_cells = [
-        [
-            Paragraph("VOLUME SOLD", style_kpi_label),
-            Paragraph("GROSS SALES REVENUE", style_kpi_label),
-            Paragraph("GROSS MARGIN PROFIT", style_kpi_label),
-            Paragraph("OPERATING COSTS", style_kpi_label)
-        ],
-        [
-            Paragraph(f"{total_qty:.1f} Units" if total_qty % 1 != 0 else f"{int(total_qty)} Units", style_kpi_value),
-            Paragraph(f"Rs. {helpers.format_currency(total_rev)[1:]}", style_kpi_value),
-            Paragraph(f"Rs. {helpers.format_currency(total_gp)[1:]}", style_kpi_value),
-            Paragraph(f"Rs. {helpers.format_currency(total_exp)[1:]}", style_kpi_value)
-        ]
-    ]
-    kpi_table = Table(kpi_cells, colWidths=[4.5*cm, 4.5*cm, 4.5*cm, 4.5*cm])
-    kpi_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#F2EFE9")),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('GRID', (0,0), (-1,-1), 1, colors.white),
-        ('TOPPADDING', (0,0), (-1,0), 6),
-        ('BOTTOMPADDING', (0,0), (-1,0), 2),
-        ('TOPPADDING', (0,1), (-1,1), 2),
-        ('BOTTOMPADDING', (0,1), (-1,1), 6),
-    ]))
-    story.append(kpi_table)
-    story.append(Spacer(1, 0.2*cm))
-
-    # Net Profit Banner
-    np_color = c_accent_green if net_profit >= 0 else c_accent_red
-    np_text = f"TOTAL DAILY NET BUSINESS PROFIT:   Rs. {helpers.format_currency(net_profit)[1:]}"
-    if net_profit < 0:
-         np_text = f"TOTAL DAILY NET BUSINESS LOSS:  -Rs. {helpers.format_currency(abs(net_profit))[1:]}"
-         
-    style_np_banner = ParagraphStyle(
-        'NpBanner', parent=styles['Normal'],
-        fontName='Helvetica-Bold', fontSize=10, textColor=colors.white,
-        alignment=1
-    )
-    np_table = Table([[Paragraph(np_text, style_np_banner)]], colWidths=[18*cm])
-    np_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), np_color),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('TOPPADDING', (0,0), (-1,-1), 6),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
-    ]))
-    story.append(np_table)
-    story.append(Spacer(1, 0.4*cm))
-
-    # ----------------------------------------------------
-    # SECTION 1: Itemized Sales Breakdown Table
-    # ----------------------------------------------------
-    story.append(Paragraph("1. ITEMIZED SALES & MARGIN BREAKDOWN", style_h1))
-    
-    sales_rows = [[
-        Paragraph("Product Description & Size", style_cell_header),
-        Paragraph("Qty", style_cell_header_right),
-        Paragraph("Sale Rate", style_cell_header_right),
-        Paragraph("Cost Rate", style_cell_header_right),
-        Paragraph("Revenue", style_cell_header_right),
-        Paragraph("Margin Profit", style_cell_header_right)
-    ]]
-    
-    for idx, s in enumerate(sales):
-        desc = f"{s['product_name']} ({s['product_brand']}) - {s['product_thickness']}, {s['product_size']}"
-        qty_text = f"{s['qty']:.1f}" if s['qty'] % 1 != 0 else f"{int(s['qty'])}"
-        
-        row_cells = [
-            Paragraph(desc, style_cell_normal),
-            Paragraph(f"{qty_text} {s['product_unit']}", style_cell_right),
-            Paragraph(f"Rs.{s['unit_price']:.2f}", style_cell_right),
-            Paragraph(f"Rs.{s['purchase_price_at_time']:.2f}", style_cell_right),
-            Paragraph(f"Rs.{s['total_revenue']:.2f}", style_cell_right),
-            Paragraph(f"Rs.{s['margin_profit']:.2f}", style_cell_right_bold)
-        ]
-        sales_rows.append(row_cells)
-
-    # Sales Totals row
-    sales_rows.append([
-        Paragraph("GRAND TOTALS", style_cell_bold),
-        Paragraph(f"{total_qty:.1f} Units" if total_qty % 1 != 0 else f"{int(total_qty)} Units", style_cell_right_bold),
-        Paragraph("", style_cell_normal),
-        Paragraph("", style_cell_normal),
-        Paragraph(f"Rs.{total_rev:.2f}", style_cell_right_bold),
-        Paragraph(f"Rs.{total_gp:.2f}", style_cell_right_bold)
-    ])
-
-    # 7.5cm for desc, 1.7cm qty, 2.2cm rates, 2.2cm total rev, 2.2cm margin
-    sales_table = Table(sales_rows, colWidths=[7.0*cm, 1.8*cm, 2.3*cm, 2.3*cm, 2.3*cm, 2.3*cm])
-    
-    sales_table_style = [
-        ('BACKGROUND', (0,0), (-1,0), c_dark),
-        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
-        ('TOPPADDING', (0,0), (-1,-1), 4),
-        ('GRID', (0,0), (-1,-1), 0.5, c_border),
-    ]
-    
-    # Alternating row colors
-    for i in range(1, len(sales_rows) - 1):
-        if i % 2 == 0:
-            sales_table_style.append(('BACKGROUND', (0, i), (-1, i), c_light))
-            
-    # Bottom summary row highlights
-    sales_table_style.extend([
-        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#F2EFE9")),
-        ('LINEABOVE', (0, -1), (-1, -1), 1.5, c_brand),
-    ])
-    
-    sales_table.setStyle(TableStyle(sales_table_style))
-    story.append(sales_table)
-    story.append(Spacer(1, 0.4*cm))
-
-    # ----------------------------------------------------
-    # SECTION 2: Daily Expenses Table
-    # ----------------------------------------------------
-    expense_data_list = []
-    expense_data_list.append([
-        Paragraph("Operating Expenditure Category", style_cell_header),
-        Paragraph("Detailed Note / Description", style_cell_header),
-        Paragraph("Amount (Rs.)", style_cell_header_right)
-    ])
-    
-    for idx, e in enumerate(expenses):
-        row_cells = [
-            Paragraph(e['category'], style_cell_bold),
-            Paragraph(e['note'] or "-", style_cell_normal),
-            Paragraph(f"Rs.{e['amount']:.2f}", style_cell_right_bold)
-        ]
-        expense_data_list.append(row_cells)
-        
-    expense_data_list.append([
-        Paragraph("TOTAL BUSINESS OPERATING EXPENDITURES", style_cell_bold),
-        Paragraph("", style_cell_normal),
-        Paragraph(f"Rs.{total_exp:.2f}", style_cell_right_bold)
-    ])
-    
-    exp_table = Table(expense_data_list, colWidths=[6.0*cm, 8.5*cm, 3.5*cm])
-    exp_table_style = [
-        ('BACKGROUND', (0,0), (-1,0), c_dark),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
-        ('TOPPADDING', (0,0), (-1,-1), 4),
-        ('GRID', (0,0), (-1,-1), 0.5, c_border),
-    ]
-    for i in range(1, len(expense_data_list) - 1):
-        if i % 2 == 0:
-            exp_table_style.append(('BACKGROUND', (0, i), (-1, i), c_light))
-    exp_table_style.extend([
-        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#FDF2F1")),
-        ('LINEABOVE', (0, -1), (-1, -1), 1.5, c_accent_red),
-    ])
-    exp_table.setStyle(TableStyle(exp_table_style))
-    
-    # Pack operating costs log inside KeepTogether to prevent visual splits
-    story.append(KeepTogether([
-        Paragraph("2. DAILY OPERATING EXPENDITURES", style_h1),
-        exp_table
-    ]))
-    story.append(Spacer(1, 0.4*cm))
-
-    # ----------------------------------------------------
-    # SECTION 3: Inventory Reconciliation Ledger Table
-    # ----------------------------------------------------
-    ledger_rows = [[
-        Paragraph("Product Specification Name", style_cell_header),
-        Paragraph("Opening", style_cell_header_right),
-        Paragraph("Intake (+)", style_cell_header_right),
-        Paragraph("Dispatch (-)", style_cell_header_right),
-        Paragraph("Closing Stock", style_cell_header_right),
-        Paragraph("Reconciliation Status", style_cell_header)
-    ]]
-
-    for idx, row in enumerate(ledger):
-        desc = f"{row['product_name']} ({row['product_brand']}) - {row['product_thickness']}"
-        op_text = f"{row['opening_stock']:.1f}" if row['opening_stock'] % 1 != 0 else f"{int(row['opening_stock'])}"
-        pur_text = f"{row['purchases_qty']:.1f}" if row['purchases_qty'] % 1 != 0 else f"{int(row['purchases_qty'])}"
-        sal_text = f"{row['sales_qty']:.1f}" if row['sales_qty'] % 1 != 0 else f"{int(row['sales_qty'])}"
-        cls_text = f"{row['closing_stock']:.1f}" if row['closing_stock'] % 1 != 0 else f"{int(row['closing_stock'])}"
-        
-        status_text = "CONFIRMED & LOCKED" if row['is_confirmed'] == 1 else "RECONCILED / ADJUSTED" if row['manual_override'] == 1 else "UNCONFIRMED STOCK"
-        if row['manual_override'] == 1 and row['override_note']:
-             status_text += f"\n({row['override_note']})"
-             
-        row_cells = [
-            Paragraph(desc, style_cell_normal),
-            Paragraph(f"{op_text} {row['product_unit']}", style_cell_right),
-            Paragraph(f"{pur_text} {row['product_unit']}" if row['purchases_qty'] > 0 else "-", style_cell_right),
-            Paragraph(f"{sal_text} {row['product_unit']}" if row['sales_qty'] > 0 else "-", style_cell_right),
-            Paragraph(f"{cls_text} {row['product_unit']}", style_cell_right_bold),
-            Paragraph(status_text, style_cell_bold if row['is_confirmed'] == 1 else style_cell_normal)
-        ]
-        ledger_rows.append(row_cells)
-
-    ledger_table = Table(ledger_rows, colWidths=[6.0*cm, 2.0*cm, 2.0*cm, 2.0*cm, 2.0*cm, 4.0*cm])
-    ledger_table_style = [
-        ('BACKGROUND', (0,0), (-1,0), c_dark),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
-        ('TOPPADDING', (0,0), (-1,-1), 4),
-        ('GRID', (0,0), (-1,-1), 0.5, c_border),
-    ]
-    for i in range(1, len(ledger_rows)):
-        row = ledger[i-1]
-        if row['is_confirmed'] == 1:
-            bg_col = colors.HexColor("#E8F8F5")  # light green
-        elif row['manual_override'] == 1:
-            bg_col = colors.HexColor("#EBF5FB")  # light blue
-        elif i % 2 == 0:
-            bg_col = c_light
-        else:
-            bg_col = colors.white
-        ledger_table_style.append(('BACKGROUND', (0, i), (-1, i), bg_col))
-
-    ledger_table.setStyle(TableStyle(ledger_table_style))
-
-    story.append(KeepTogether([
-        Paragraph("3. PHYSICAL STOCK RECONCILIATION SUMMARY", style_h1),
-        ledger_table
-    ]))
-
-    # Footer signature line
-    story.append(Spacer(1, 1.2*cm))
-    sig_data = [
-        [Paragraph("Report Generated Electronically", style_cell_normal), Paragraph("Authorized Store Manager Signature", style_cell_right)],
-        [Paragraph("", style_cell_normal), Paragraph("_____________________________________", style_cell_right)]
-    ]
-    sig_table = Table(sig_data, colWidths=[9.0*cm, 9.0*cm])
-    sig_table.setStyle(TableStyle([
-        ('VALIGN', (0,0), (-1,-1), 'TOP'),
-        ('TOPPADDING', (0,0), (-1,-1), 0),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 2),
-    ]))
-    
-    story.append(KeepTogether([sig_table]))
-
-    # Build Document
-    doc.build(story)
-    return True
+    return export_report_excel(date_str, date_str, filepath)

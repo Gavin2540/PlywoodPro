@@ -16,3 +16,7 @@ data/
 # OS generated files
 .DS_Store
 Thumbs.db
+.venv/
+*.zip
+.pytest_cache/
+screenshots/

@@ -30,7 +30,7 @@ echo.
 
 REM ── Step 2: Install/verify dependencies ─────────────────────────
 echo [2/6] Verifying dependencies...
-python -m pip install -r requirements.txt >nul 2>&1
+python -m pip install -r requirements-dev.txt >nul 2>&1
 if %ERRORLEVEL% neq 0 (
     echo ERROR: Failed to install requirements.
     goto error
@@ -48,7 +48,7 @@ echo       Done.
 echo.
 
 echo [4/6] Building Plywood Pro.exe with PyInstaller...
-pyinstaller --onefile --windowed --icon=icon.ico --name="Plywood Pro" --hidden-import unicodedata --add-data "database/schema.sql;database" --add-data "icon.ico;." main.py
+python tools\build.py
 if %ERRORLEVEL% neq 0 (
     echo.
     echo ERROR: PyInstaller build failed.
@@ -66,6 +66,7 @@ if %ERRORLEVEL% neq 0 (
     echo ERROR: Failed to create zip archive.
     goto error
 )
+powershell -NoProfile -Command "(Get-FileHash 'PlywoodPro_v%NEW_VERSION%.zip' -Algorithm SHA256).Hash.ToLower() + '  PlywoodPro_v%NEW_VERSION%.zip' | Out-File -Encoding ascii 'PlywoodPro_v%NEW_VERSION%.zip.sha256'"
 echo       Done. Archive: PlywoodPro_v%NEW_VERSION%.zip
 echo.
 
@@ -74,7 +75,7 @@ echo [6/6] Committing, tagging, and pushing to GitHub...
 git add -A
 git commit -m "release v%NEW_VERSION%"
 git tag "v%NEW_VERSION%"
-git push origin master --tags
+git push origin HEAD --tags
 if %ERRORLEVEL% neq 0 (
     echo.
     echo WARNING: Git push may have failed. Check your remote settings.
@@ -86,7 +87,7 @@ echo.
 
 REM ── Final: GitHub Release Creation ────────────────────────────────
 echo [7/7] Creating GitHub Release and uploading zip...
-gh release create "v%NEW_VERSION%" "PlywoodPro_v%NEW_VERSION%.zip" --title "PlywoodPro v%NEW_VERSION%" --notes "Release v%NEW_VERSION%"
+gh release create "v%NEW_VERSION%" "PlywoodPro_v%NEW_VERSION%.zip" "PlywoodPro_v%NEW_VERSION%.zip.sha256" --title "PlywoodPro v%NEW_VERSION%" --notes "Release v%NEW_VERSION%"
 if %ERRORLEVEL% neq 0 (
     echo.
     echo WARNING: Failed to create GitHub release via CLI.

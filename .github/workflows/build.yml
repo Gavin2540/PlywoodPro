@@ -1,0 +1,71 @@
+# Builds the Windows .exe on GitHub's Windows machines, so releases can be made from a Mac.
+#
+#   Test build:  GitHub > Actions > "Build Windows app" > Run workflow  (download the .exe from the run's Artifacts)
+#   Release:     set CURRENT_VERSION in utils/updater.py, commit, then
+#                git tag v2.0.0 && git push origin v2.0.0
+#                -> tests run, the .exe is built, zipped and published as a GitHub Release.
+#                   Installed copies of the app pick it up through the auto-updater.
+name: Build Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: python -m pip install -r requirements-dev.txt
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Check the tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          app=$(python -c "from utils.updater import CURRENT_VERSION as v; print(v)")
+          if [ "v$app" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match CURRENT_VERSION $app in utils/updater.py"; exit 1
+          fi
+      - name: Build
+        run: python tools/build.py
+      - name: Self-test the built .exe (opens every screen, saves a sale, writes PDF/Excel/backup)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/Plywood Pro.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-ChildItem "$env:TEMP" -Filter "plywoodpro-selftest-*" -Directory | ForEach-Object { Get-Content (Join-Path $_.FullName "selftest.log") }
+          if ($p.ExitCode -ne 0) { throw "Self-test failed" }
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = python -c "from utils.updater import CURRENT_VERSION as v; print(v)"
+          $zip = "PlywoodPro_v$v.zip"
+          Compress-Archive -Path "dist/Plywood Pro.exe" -DestinationPath $zip -Force
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  $zip" | Out-File -Encoding ascii "$zip.sha256"
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlywoodPro-windows
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+            dist/Plywood Pro.exe
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+          generate_release_notes: true
