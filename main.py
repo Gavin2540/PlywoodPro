@@ -43,7 +43,8 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--selftest" in argv:
         from utils import selftest
-        return selftest.run()
+        code = selftest.run()
+        os._exit(code)  # skip Qt/interpreter teardown, which can crash after an offscreen run
     from PySide6.QtWidgets import QApplication, QMessageBox
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Plywood Pro")
